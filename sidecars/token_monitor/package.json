@@ -1,0 +1,6 @@
+{
+  "name": "antigravity-token-monitor",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Minimalist real-time Token monitor sidecar for Antigravity"
+}

@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Antigravity Token Monitor</title>
+  <script src="/preload.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <!-- Top Header -->
+    <header class="topbar">
+      <div class="brand">
+        <span id="live-dot" class="live-dot" title="实时监控中"></span>
+        <span class="brand-title">Token 监控</span>
+      </div>
+      <div class="controls">
+        <nav class="seg" role="tablist" aria-label="视图切换">
+          <button type="button" role="tab" id="tab-current" class="seg-btn active" aria-selected="true" data-tab="current">当前对话</button>
+          <button type="button" role="tab" id="tab-overview" class="seg-btn" aria-selected="false" data-tab="overview">全局总览</button>
+        </nav>
+        <button type="button" id="btn-settings" class="icon-btn" title="单价与币种设置" aria-label="单价与币种设置">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- View 1: Current Session -->
+    <main id="view-current" class="pane active">
+      <div id="cur-empty" class="empty hidden">
+        <div class="empty-title">等待对话产生 Token 记录</div>
+        <div class="empty-sub">在当前对话中发送消息后，这里将自动实时更新。</div>
+      </div>
+
+      <div id="cur-content" class="stack">
+        <!-- Context Window Progress -->
+        <section class="card">
+          <div class="row-between">
+            <span class="label">上下文窗口</span>
+            <span class="mono-strong">
+              <span id="ctx-used">0</span>
+              <span class="muted-inline"> / <span id="ctx-limit">1M</span> (<span id="ctx-pct">0%</span>)</span>
+            </span>
+          </div>
+          <div class="progress-track" role="progressbar" aria-label="上下文占用比例">
+            <div id="ctx-bar-cache" class="progress-seg seg-cache" style="width:0%"></div>
+            <div id="ctx-bar-input" class="progress-seg seg-input" style="width:0%"></div>
+          </div>
+          <div class="row-between meta-row">
+            <span id="cur-model" class="model-tag">—</span>
+            <span id="ctx-status" class="status-pill ok">空间充足</span>
+          </div>
+        </section>
+
+        <!-- 2x2 KPI Cards -->
+        <section class="kpi-grid">
+          <div class="kpi-card">
+            <div class="kpi-label">累计 Token</div>
+            <div id="cur-total" class="kpi-val">0</div>
+            <div id="cur-calls" class="kpi-sub">0 次调用</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">估算费用</div>
+            <div id="cur-cost" class="kpi-val">$0.00</div>
+            <div id="cur-saved" class="kpi-sub ok-text">缓存省 $0.00</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">缓存命中率</div>
+            <div id="cur-hit-rate" class="kpi-val ok-text">0%</div>
+            <div id="cur-cache-abs" class="kpi-sub">0 命中</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">新输入 / 输出</div>
+            <div id="cur-io" class="kpi-val">0 / 0</div>
+            <div id="cur-subagents" class="kpi-sub">含子助手 0 个</div>
+          </div>
+        </section>
+
+        <!-- 3-Segment Composition Bar -->
+        <section class="card compact">
+          <div class="comp-track">
+            <div id="comp-cache" class="comp-seg seg-cache" style="width:0%"></div>
+            <div id="comp-input" class="comp-seg seg-input" style="width:0%"></div>
+            <div id="comp-output" class="comp-seg seg-output" style="width:0%"></div>
+          </div>
+          <div class="legend-row">
+            <span class="legend-item"><i class="dot seg-cache"></i>缓存 <span id="pct-cache" class="mono">0%</span></span>
+            <span class="legend-item"><i class="dot seg-input"></i>新输入 <span id="pct-input" class="mono">0%</span></span>
+            <span class="legend-item"><i class="dot seg-output"></i>输出 <span id="pct-output" class="mono">0%</span></span>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <!-- View 2: Global Overview -->
+    <main id="view-overview" class="pane">
+      <div class="stack">
+        <!-- Time Range Bar -->
+        <div class="row-between">
+          <span class="label">统计周期</span>
+          <div class="range-bar" role="group" aria-label="统计周期">
+            <button type="button" class="range-btn active" data-range="today">今日</button>
+            <button type="button" class="range-btn" data-range="7d">7天</button>
+            <button type="button" class="range-btn" data-range="30d">30天</button>
+            <button type="button" class="range-btn" data-range="all">全部</button>
+          </div>
+        </div>
+
+        <!-- 2 Summary Cards -->
+        <section class="kpi-grid">
+          <div class="kpi-card">
+            <div class="kpi-label">总消耗 Token</div>
+            <div id="ov-total" class="kpi-val">0</div>
+            <div id="ov-sessions" class="kpi-sub">0 个对话</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">总估算费用</div>
+            <div id="ov-cost" class="kpi-val">$0.00</div>
+            <div id="ov-hit-rate" class="kpi-sub ok-text">平均缓存率 0%</div>
+          </div>
+        </section>
+
+        <!-- Per-Model Breakdown -->
+        <section class="card">
+          <div class="row-between mb-sm">
+            <span class="label">分模型消耗</span>
+            <span id="ov-saved" class="kpi-sub ok-text">缓存共省 $0.00</span>
+          </div>
+          <div id="ov-models" class="model-list">
+            <div class="empty-inline">该时间段暂无调用记录</div>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <!-- Pricing Settings Drawer -->
+  <div id="settings-backdrop" class="drawer-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="drawer">
+      <div class="drawer-head">
+        <span id="settings-title" class="brand-title">单价与币种设置</span>
+        <button type="button" id="btn-close-settings" class="icon-btn" aria-label="关闭">✕</button>
+      </div>
+      <div class="drawer-body">
+        <div class="setting-row">
+          <span class="label">显示币种</span>
+          <div class="seg">
+            <button type="button" id="cur-usd" class="seg-btn active" data-currency="USD">美元 ($)</button>
+            <button type="button" id="cur-cny" class="seg-btn" data-currency="CNY">人民币 (¥)</button>
+          </div>
+        </div>
+        <div class="setting-row">
+          <label for="rate-input" class="label">USD → CNY 汇率</label>
+          <input id="rate-input" type="number" step="0.01" min="0.01" class="num-input sm" value="7.25">
+        </div>
+
+        <div class="section-divider">模型单价（美元 / 百万 Token）& 上下文上限</div>
+        <div id="pricing-models" class="pricing-list"></div>
+
+        <details id="other-models-wrap" class="other-models">
+          <summary>展开其他预置模型</summary>
+          <div id="pricing-models-other" class="pricing-list"></div>
+        </details>
+      </div>
+      <div class="drawer-foot">
+        <button type="button" id="btn-reset-pricing" class="btn-ghost">恢复默认</button>
+        <div class="foot-right">
+          <span id="save-toast" class="save-toast hidden">已保存</span>
+          <button type="button" id="btn-save-pricing" class="btn-primary">保存设置</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
