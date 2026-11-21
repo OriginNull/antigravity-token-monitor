@@ -127,6 +127,36 @@
     return `较同会话上次请求上下文变化：${signed} Token`;
   }
 
+  function fmtTps(tps, compact = false) {
+    if (tps === null || tps === undefined || !Number.isFinite(Number(tps))) return '';
+    const n = Number(tps);
+    if (n <= 0) return '';
+    const numStr = compact || n >= 100 ? String(Math.round(n)) : n.toFixed(1);
+    return `${numStr} tok/s`;
+  }
+
+  function fmtDuration(ms) {
+    if (ms === null || ms === undefined || !Number.isFinite(Number(ms))) return '—';
+    const sec = Number(ms) / 1000;
+    if (sec < 60) return `${sec.toFixed(1)}s`;
+    const m = Math.floor(sec / 60);
+    const s = Math.round(sec % 60);
+    return `${m}m ${s}s`;
+  }
+
+  function tpsTone(tps, output = 100) {
+    if (tps === null || tps === undefined || !Number.isFinite(Number(tps))) return '';
+    const n = Number(tps);
+    if (n >= 50) return 'fast';
+    if (n < 15 && Number(output) >= 80) return 'slow';
+    return '';
+  }
+
+  function fmtSpeedTitle(durationMs) {
+    const dur = durationMs ? `耗时 ${fmtDuration(durationMs)} · ` : '';
+    return `${dur}端到端输出速度（含思考与首字等待）`;
+  }
+
   const esc = (s) =>
     String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -198,6 +228,9 @@
         const showModel = c.model && c.model !== activeModel;
         const deltaText = fmtDelta(c.contextDelta);
         const deltaClass = c.contextDelta !== null && c.contextDelta < 0 ? 'call-delta down' : 'call-delta';
+        const tpsText = fmtTps(c.tps);
+        const tone = tpsTone(c.tps, c.output);
+        const tpsClass = tone ? `call-tps ${tone}` : 'call-tps';
         const hitPct = Math.round(Number(c.cacheHitRate) || 0);
         const subTitle = c.isSubagent ? `子助手 ${c.convShort || ''} · ${c.modelDisplay || c.model}` : c.modelDisplay || c.model;
 
@@ -207,6 +240,7 @@
               <div class="call-left">
                 <span class="call-time">${fmtTime(c.ts)}</span>
                 ${c.isSubagent ? '<span class="call-badge">子</span>' : ''}
+                ${tpsText ? `<span class="${tpsClass}" title="${esc(fmtSpeedTitle(c.durationMs))}">${tpsText}</span>` : ''}
                 ${showModel ? `<span class="call-model">${esc(c.modelDisplay || c.model)}</span>` : ''}
               </div>
               <div class="call-right">
@@ -265,6 +299,26 @@
       statusEl.textContent = '空间充足';
     }
 
+    // 单行输出速度栏
+    const sp = data.speed || {};
+    const lastTpsEl = $('cur-last-tps');
+    if (lastTpsEl) {
+      const lastTpsText = fmtTps(sp.lastTps);
+      lastTpsEl.textContent = lastTpsText || '—';
+      lastTpsEl.className = 'speed-val';
+      const tone = tpsTone(sp.lastTps, sp.lastOutput);
+      if (tone === 'fast') lastTpsEl.classList.add('ok-text');
+      else if (tone === 'slow') lastTpsEl.classList.add('warn-text');
+    }
+    const avgTpsEl = $('cur-avg-tps');
+    if (avgTpsEl) {
+      avgTpsEl.textContent = sp.avgTps ? (sp.avgTps >= 100 ? String(Math.round(sp.avgTps)) : sp.avgTps.toFixed(1)) : '—';
+    }
+    const lastDurEl = $('cur-last-dur');
+    if (lastDurEl) {
+      lastDurEl.textContent = fmtDuration(sp.lastDurationMs);
+    }
+
     $('cur-total').textContent = fmtTokens(totals.totalTokens);
     $('cur-calls').textContent = `${totals.callCount} 次调用`;
     $('cur-cost').textContent = fmtMoney(totals.costUsd, currency, cnyRate);
@@ -307,10 +361,16 @@
         .map((m, idx) => {
           const color = MODEL_COLORS[idx % MODEL_COLORS.length];
           const width = Math.max(2, Math.min(100, m.pct));
+          const mTps = fmtTps(m.avgTps, true);
+          const mTone = tpsTone(m.avgTps, 100);
+          const mTpsClass = mTone ? `model-tps ${mTone}` : 'model-tps';
           return `
             <div class="model-item">
               <div class="model-head">
-                <span class="model-name" title="${esc(m.model)}">${esc(m.display)}</span>
+                <div class="model-title-wrap">
+                  <span class="model-name" title="${esc(m.model)}">${esc(m.display)}</span>
+                  ${mTps ? `<span class="${mTpsClass}" title="周期内加权平均输出速度（含思考与首字等待）">${mTps}</span>` : ''}
+                </div>
                 <span class="model-nums">${fmtTokens(m.total)} · ${fmtMoney(m.costUsd, currency, cnyRate)} (${Math.round(m.pct)}%)</span>
               </div>
               <div class="model-bar-track">
@@ -371,6 +431,9 @@
         const isCur = Boolean(activeConv && c.convId && c.convId.toLowerCase() === activeConv);
         const deltaText = fmtDelta(c.contextDelta);
         const deltaClass = c.contextDelta !== null && c.contextDelta < 0 ? 'call-delta down' : 'call-delta';
+        const tpsText = fmtTps(c.tps);
+        const tone = tpsTone(c.tps, c.output);
+        const tpsClass = tone ? `call-tps ${tone}` : 'call-tps';
         const hitPct = Math.round(Number(c.cacheHitRate) || 0);
         const title = `${c.modelDisplay || c.model} · 会话 ${c.convShort || ''}`;
 
@@ -380,6 +443,7 @@
               <div class="call-left">
                 <span class="call-time">${fmtTime(c.ts, true)}</span>
                 ${isCur ? '<span class="call-badge cur">当前</span>' : ''}
+                ${tpsText ? `<span class="${tpsClass}" title="${esc(fmtSpeedTitle(c.durationMs))}">${tpsText}</span>` : ''}
                 <span class="call-model">${esc(c.modelDisplay || c.model)}</span>
               </div>
               <div class="call-right">

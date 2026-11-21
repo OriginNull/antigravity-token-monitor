@@ -22,6 +22,12 @@ const DELEGATION_RESPONSE_HINT_RE = /conversationId|conversation_id|conversation
 const MAX_TRANSCRIPT_CACHE = 1000;
 const MAX_OVERVIEW_CACHE = 8;
 const MAX_RECENT_CALLS = 80;
+const MAX_TIMING_ENTRIES = 4000;
+const MIN_DURATION_MS = 400;
+const MAX_DURATION_MS = 180_000;
+const MAX_AVG_DURATION_MS = 120_000;
+const MIN_AVG_OUTPUT_TOKENS = 20;
+const MAX_VALID_TPS = 600;
 
 const STATIC_FILES = {
   '/styles.css': ['styles.css', 'text/css; charset=utf-8'],
@@ -85,17 +91,93 @@ function findAppDataDirs() {
     .filter((candidate) => existsSync(join(candidate, 'brain')));
 }
 
-function pricingFilePath() {
+function dataFilePath(filename) {
   const dataDir = process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR;
   if (dataDir) {
     try {
       mkdirSync(dataDir, { recursive: true });
-      return join(dataDir, 'pricing.json');
+      return join(dataDir, filename);
     } catch {
       // fall through
     }
   }
-  return join(__dirname, 'pricing.json');
+  return join(__dirname, filename);
+}
+
+function pricingFilePath() {
+  return dataFilePath('pricing.json');
+}
+
+function timingsFilePath() {
+  return dataFilePath('timings.json');
+}
+
+// ---------------------------------------------------------------------------
+// Observed step duration store (captures live mtime for text-only responses)
+// ---------------------------------------------------------------------------
+
+let timingsLoadedPath = null;
+const observedDurations = new Map(); // `${convId}:${step}` -> durationMs
+
+function ensureTimingsLoaded() {
+  const fp = timingsFilePath();
+  if (timingsLoadedPath === fp) return;
+  timingsLoadedPath = fp;
+  observedDurations.clear();
+  try {
+    if (!existsSync(fp)) return;
+    const raw = JSON.parse(readFileSync(fp, 'utf-8'));
+    if (raw && typeof raw === 'object') {
+      for (const [k, v] of Object.entries(raw)) {
+        const ms = Number(v);
+        if (k && Number.isFinite(ms) && ms >= MIN_DURATION_MS && ms <= MAX_DURATION_MS) {
+          observedDurations.set(k, Math.round(ms));
+        }
+      }
+    }
+  } catch {
+    // ignore corrupt cache
+  }
+}
+
+function getObservedDuration(convId, step) {
+  ensureTimingsLoaded();
+  return observedDurations.get(`${convId}:${step}`) ?? null;
+}
+
+function recordObservedDuration(convId, step, durationMs) {
+  const ms = Math.round(Number(durationMs));
+  if (!Number.isFinite(ms) || ms < MIN_DURATION_MS || ms > MAX_DURATION_MS) return;
+  ensureTimingsLoaded();
+  const key = `${convId}:${step}`;
+  if (observedDurations.get(key) === ms) return;
+  if (observedDurations.has(key)) observedDurations.delete(key);
+  observedDurations.set(key, ms);
+  while (observedDurations.size > MAX_TIMING_ENTRIES) {
+    const oldest = observedDurations.keys().next().value;
+    observedDurations.delete(oldest);
+  }
+  try {
+    writeFileSync(timingsFilePath(), JSON.stringify(Object.fromEntries(observedDurations)) + '\n', 'utf-8');
+  } catch {
+    // ignore write failure in read-only env
+  }
+}
+
+function calcStepTps(output, durationMs) {
+  if (!(output > 0) || !(durationMs >= MIN_DURATION_MS) || durationMs > MAX_DURATION_MS) return null;
+  const tps = output / (durationMs / 1000);
+  if (!Number.isFinite(tps) || tps <= 0 || tps > MAX_VALID_TPS) return null;
+  return tps;
+}
+
+function isAvgSpeedSample(output, durationMs, tps) {
+  return (
+    tps !== null &&
+    output >= MIN_AVG_OUTPUT_TOKENS &&
+    durationMs >= MIN_DURATION_MS &&
+    durationMs <= MAX_AVG_DURATION_MS
+  );
 }
 
 function sanitizeModelRule(rule, base) {
@@ -296,6 +378,10 @@ function parseTranscript(appData, convId) {
   const subagentIds = new Set();
   // 记录当前 PLANNER_RESPONSE 派发后待匹配的工具响应队列（每项表示该响应是否属于委派类工具）
   let pendingToolFlags = [];
+  // 用于推导单步端到端耗时
+  let pendingDurationCall = null;
+  let pendingDurationHasTools = false;
+  let lastRecordCall = null;
 
   const lines = text.split('\n');
   for (const line of lines) {
@@ -313,19 +399,31 @@ function parseTranscript(appData, convId) {
       const cache = Number(obj.cache_read_tokens) || 0;
       const output = Number(obj.output_tokens) || 0;
       const model = typeof obj.model === 'string' && obj.model ? obj.model : 'unknown';
-      const ts = typeof obj.created_at === 'string' ? Date.parse(obj.created_at) : NaN;
+      const rawTs = typeof obj.created_at === 'string' ? Date.parse(obj.created_at) : NaN;
+      const hasTools = Array.isArray(obj.tool_calls) && obj.tool_calls.length > 0;
+      pendingDurationCall = null;
+      pendingDurationHasTools = false;
+      lastRecordCall = null;
+
       if (input > 0 || cache > 0 || output > 0) {
-        calls.push({
+        const callItem = {
           step: Number(obj.step_index) || 0,
-          ts: Number.isFinite(ts) ? ts : st.mtime,
+          ts: Number.isFinite(rawTs) ? rawTs : st.mtime,
+          rawTs: Number.isFinite(rawTs) ? rawTs : null,
           model,
           input,
           cache,
           output,
-        });
+          durationMs: null,
+          tps: null,
+        };
+        calls.push(callItem);
+        pendingDurationCall = callItem;
+        pendingDurationHasTools = hasTools;
+        lastRecordCall = callItem;
       }
       pendingToolFlags = [];
-      if (Array.isArray(obj.tool_calls)) {
+      if (hasTools) {
         for (const tc of obj.tool_calls) {
           const name = tc?.name;
           const isDelegation = typeof name === 'string' && DELEGATION_TOOLS.has(name);
@@ -346,28 +444,66 @@ function parseTranscript(appData, convId) {
           }
         }
       }
-    } else if (obj.type === 'SYSTEM_MESSAGE' && typeof obj.content === 'string') {
-      // 匹配系统转发的 subagent / swarm / workflow 回传消息（例如 sender=<uuid>）
-      const senderMatches = obj.content.matchAll(/\bsender=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/gi);
-      for (const m of senderMatches) {
-        const norm = m[1].toLowerCase();
-        if (norm !== selfLower) subagentIds.add(norm);
+    } else {
+      lastRecordCall = null;
+      // 带工具调用的 PLANNER_RESPONSE 紧随其后的首条 GENERIC 记录其开始执行时间戳，可用于推导端到端生成耗时
+      if (pendingDurationCall && pendingDurationHasTools && obj.type === 'GENERIC') {
+        const nextTs = typeof obj.created_at === 'string' ? Date.parse(obj.created_at) : NaN;
+        if (Number.isFinite(nextTs) && pendingDurationCall.rawTs !== null) {
+          const dt = Math.round(nextTs - pendingDurationCall.rawTs);
+          if (dt >= MIN_DURATION_MS && dt <= MAX_DURATION_MS) {
+            pendingDurationCall.durationMs = dt;
+          }
+        }
+        pendingDurationCall = null;
+        pendingDurationHasTools = false;
+      } else if (obj.type === 'USER_INPUT') {
+        pendingDurationCall = null;
+        pendingDurationHasTools = false;
       }
-      if (DELEGATION_RESPONSE_HINT_RE.test(obj.content)) {
-        const refMatches = obj.content.matchAll(/(?:conversation:\/\/|conversationId["']?\s*[:=]\s*["']?)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/gi);
-        for (const m of refMatches) {
+
+      if (obj.type === 'SYSTEM_MESSAGE' && typeof obj.content === 'string') {
+        // 匹配系统转发的 subagent / swarm / workflow 回传消息（例如 sender=<uuid>）
+        const senderMatches = obj.content.matchAll(/\bsender=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/gi);
+        for (const m of senderMatches) {
           const norm = m[1].toLowerCase();
           if (norm !== selfLower) subagentIds.add(norm);
         }
+        if (DELEGATION_RESPONSE_HINT_RE.test(obj.content)) {
+          const refMatches = obj.content.matchAll(/(?:conversation:\/\/|conversationId["']?\s*[:=]\s*["']?)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/gi);
+          for (const m of refMatches) {
+            const norm = m[1].toLowerCase();
+            if (norm !== selfLower) subagentIds.add(norm);
+          }
+        }
+      } else if (pendingToolFlags.length > 0 && obj.type !== 'USER_INPUT') {
+        const isDelegationResp = pendingToolFlags.shift();
+        if (isDelegationResp && typeof obj.content === 'string' && DELEGATION_RESPONSE_HINT_RE.test(obj.content)) {
+          extractUuids(obj.content, selfLower, subagentIds);
+        }
+      } else if (obj.type === 'USER_INPUT') {
+        pendingToolFlags = [];
       }
-    } else if (pendingToolFlags.length > 0 && obj.type !== 'USER_INPUT') {
-      const isDelegationResp = pendingToolFlags.shift();
-      if (isDelegationResp && typeof obj.content === 'string' && DELEGATION_RESPONSE_HINT_RE.test(obj.content)) {
-        extractUuids(obj.content, selfLower, subagentIds);
-      }
-    } else if (obj.type === 'USER_INPUT') {
-      pendingToolFlags = [];
     }
+  }
+
+  // 若文件最后一条有效记录就是 PLANNER_RESPONSE，文件 mtime 即该回复写完落盘的毫秒时间
+  if (lastRecordCall && lastRecordCall.durationMs === null && lastRecordCall.rawTs !== null) {
+    const dt = Math.round(st.mtime - lastRecordCall.rawTs);
+    if (dt >= MIN_DURATION_MS && dt <= MAX_DURATION_MS) {
+      lastRecordCall.durationMs = dt;
+      recordObservedDuration(selfLower, lastRecordCall.step, dt);
+    }
+  }
+
+  // 回填历史上已实时观测到的耗时并计算每步端到端输出速度
+  for (const c of calls) {
+    if (c.durationMs === null) {
+      const obs = getObservedDuration(selfLower, c.step);
+      if (obs !== null) c.durationMs = obs;
+    }
+    c.tps = calcStepTps(c.output, c.durationMs);
+    delete c.rawTs;
   }
 
   // 仅保留磁盘上真实存在 transcript.jsonl 的子会话，避免误关联
@@ -466,6 +602,9 @@ function buildCurrentSnapshot(requestedConvId, pricing) {
   let callCount = 0;
   let costUsd = 0;
   let savedUsd = 0;
+  let speedOutput = 0;
+  let speedDurationMs = 0;
+  let speedSamples = 0;
   const modelsSeen = new Set();
   const allCalls = [];
   let seq = 0;
@@ -483,6 +622,12 @@ function buildCurrentSnapshot(requestedConvId, pricing) {
       const { cost, saved } = calcCostUsd(c.input, c.cache, c.output, rule);
       costUsd += cost;
       savedUsd += saved;
+
+      if (isAvgSpeedSample(c.output, c.durationMs, c.tps)) {
+        speedOutput += c.output;
+        speedDurationMs += c.durationMs;
+        speedSamples += 1;
+      }
 
       const ctxNow = c.input + c.cache;
       const contextDelta = prevCtx !== null ? ctxNow - prevCtx : null;
@@ -504,6 +649,8 @@ function buildCurrentSnapshot(requestedConvId, pricing) {
         cacheHitRate: ctxNow > 0 ? (c.cache / ctxNow) * 100 : 0,
         costUsd: cost,
         contextDelta,
+        durationMs: c.durationMs,
+        tps: c.tps,
       });
     }
   };
@@ -518,6 +665,12 @@ function buildCurrentSnapshot(requestedConvId, pricing) {
   const recentCalls = allCalls.slice(0, MAX_RECENT_CALLS).map(({ seq: _seq, ...item }) => item);
   const mainCallCount = main.calls.length;
   const subagentCallCount = callCount - mainCallCount;
+
+  const latestSpeedCall =
+    allCalls.find((c) => !c.isSubagent && c.tps !== null) ||
+    allCalls.find((c) => c.tps !== null) ||
+    null;
+  const avgTps = speedDurationMs > 0 ? speedOutput / (speedDurationMs / 1000) : null;
 
   const lastCall = main.calls.length ? main.calls[main.calls.length - 1] : null;
   const activeModel = lastCall?.model || [...modelsSeen][0] || 'unknown';
@@ -548,6 +701,13 @@ function buildCurrentSnapshot(requestedConvId, pricing) {
       input: contextInput,
       limit: contextLimit,
       pct: contextPct,
+    },
+    speed: {
+      lastTps: latestSpeedCall ? latestSpeedCall.tps : null,
+      lastDurationMs: latestSpeedCall ? latestSpeedCall.durationMs : null,
+      lastOutput: latestSpeedCall ? latestSpeedCall.output : 0,
+      avgTps,
+      sampleCount: speedSamples,
     },
     totals: {
       totalTokens,
@@ -665,6 +825,8 @@ function buildOverviewSnapshot(range, pricing, requestedEtag = '') {
           total: 0,
           costUsd: 0,
           calls: 0,
+          speedOutput: 0,
+          speedDurationMs: 0,
         };
         byModel.set(c.model, bucket);
       }
@@ -674,6 +836,10 @@ function buildOverviewSnapshot(range, pricing, requestedEtag = '') {
       bucket.total += c.input + c.cache + c.output;
       bucket.costUsd += cost;
       bucket.calls += 1;
+      if (isAvgSpeedSample(c.output, c.durationMs, c.tps)) {
+        bucket.speedOutput += c.output;
+        bucket.speedDurationMs += c.durationMs;
+      }
 
       if (c.ts >= recentCutoffTs) {
         recentPool.push({
@@ -692,6 +858,8 @@ function buildOverviewSnapshot(range, pricing, requestedEtag = '') {
           cacheHitRate: ctxNow > 0 ? (c.cache / ctxNow) * 100 : 0,
           costUsd: cost,
           contextDelta,
+          durationMs: c.durationMs,
+          tps: c.tps,
         });
         if (recentPool.length > MAX_RECENT_CALLS * 4) {
           recentPool.sort(sortRecent);
@@ -713,9 +881,10 @@ function buildOverviewSnapshot(range, pricing, requestedEtag = '') {
 
   const models = [...byModel.values()]
     .sort((a, b) => b.total - a.total)
-    .map((m) => ({
+    .map(({ speedOutput: mOut, speedDurationMs: mDur, ...m }) => ({
       ...m,
       pct: totalTokens > 0 ? (m.total / totalTokens) * 100 : 0,
+      avgTps: mDur > 0 ? mOut / (mDur / 1000) : null,
     }));
 
   const snapshot = {
@@ -775,10 +944,46 @@ function buildPricingResponse() {
 }
 
 // ---------------------------------------------------------------------------
+// Background timing sampler (captures text-only reply durations even when pane is closed)
+// ---------------------------------------------------------------------------
+
+const WATCH_INTERVAL_MS = 2500;
+const ACTIVE_WINDOW_MS = 60_000;
+const lastWatchedStats = new Map(); // filePath -> `${mtime}:${size}`
+
+function sampleActiveTranscripts() {
+  const now = Date.now();
+  const dirs = findAppDataDirs();
+  for (const appData of dirs) {
+    const brainDir = join(appData, 'brain');
+    for (const entry of safeReaddir(brainDir)) {
+      if (!ID_RE.test(entry)) continue;
+      const fp = transcriptPath(appData, entry);
+      const st = statOf(fp);
+      if (st.size <= 0 || now - st.mtime > ACTIVE_WINDOW_MS) continue;
+      const sig = `${st.mtime}:${st.size}`;
+      if (lastWatchedStats.get(fp) === sig) continue;
+      lastWatchedStats.set(fp, sig);
+      parseTranscript(appData, entry);
+    }
+  }
+  if (lastWatchedStats.size > MAX_TRANSCRIPT_CACHE) {
+    lastWatchedStats.clear();
+  }
+}
+
+function startTimingWatcher() {
+  sampleActiveTranscripts();
+  const timer = setInterval(sampleActiveTranscripts, WATCH_INTERVAL_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+}
+
+// ---------------------------------------------------------------------------
 // Server bootstrap (SidecarApp in Antigravity, HTTP fallback standalone)
 // ---------------------------------------------------------------------------
 
 async function start() {
+  startTimingWatcher();
   let sdk = null;
   try {
     sdk = await import('sidecar_sdk');

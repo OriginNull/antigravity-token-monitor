@@ -3,3 +3,4 @@
 node_modules/
 *.log
 sidecars/token_monitor/pricing.json
+sidecars/token_monitor/timings.json
