@@ -7,6 +7,7 @@
  * Persists user-customized model pricing & currency settings in:
  *   <ANTIGRAVITY_EXECUTABLE_DATA_DIR>/pricing.json (or alongside main.mjs standalone)
  */
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { homedir } from 'node:os';
@@ -16,6 +17,10 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const UUID_GLOBAL_RE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+const DELEGATION_TOOLS = new Set(['invoke_subagent', 'send_message', 'manage_subagents', 'swarm', 'run_workflow']);
+const DELEGATION_RESPONSE_HINT_RE = /conversationId|conversation_id|conversation:\/\/|subagent|swarm|worker|workflow/i;
+const MAX_TRANSCRIPT_CACHE = 1000;
+const MAX_OVERVIEW_CACHE = 8;
 
 const STATIC_FILES = {
   '/styles.css': ['styles.css', 'text/css; charset=utf-8'],
@@ -211,14 +216,61 @@ function calcCostUsd(input, cache, output, rule) {
   return { cost, saved };
 }
 
+function shortHash(text) {
+  return createHash('sha1').update(text).digest('hex').slice(0, 16);
+}
+
+function pricingHash(pricing) {
+  return shortHash(
+    JSON.stringify({
+      currency: pricing.currency,
+      cnyRate: pricing.cnyRate,
+      fallback: pricing.fallback,
+      models: pricing.models,
+    }),
+  );
+}
+
 // ---------------------------------------------------------------------------
-// Transcript parser with mtime+size cache
+// Transcript parser with mtime+size LRU cache
 // ---------------------------------------------------------------------------
 
 const transcriptCache = new Map(); // filePath -> { key, parsed }
+const overviewCache = new Map(); // range -> { etag, snapshot }
 
 function transcriptPath(appData, convId) {
   return join(appData, 'brain', convId, '.system_generated', 'logs', 'transcript.jsonl');
+}
+
+function getCachedTranscript(fp, key) {
+  const cached = transcriptCache.get(fp);
+  if (!cached || cached.key !== key) return null;
+  // 刷新至 Map 尾部，维护 LRU 顺序
+  transcriptCache.delete(fp);
+  transcriptCache.set(fp, cached);
+  return cached.parsed;
+}
+
+function setCachedTranscript(fp, key, parsed) {
+  if (transcriptCache.has(fp)) {
+    transcriptCache.delete(fp);
+  }
+  transcriptCache.set(fp, { key, parsed });
+  while (transcriptCache.size > MAX_TRANSCRIPT_CACHE) {
+    const oldestKey = transcriptCache.keys().next().value;
+    transcriptCache.delete(oldestKey);
+  }
+}
+
+function extractUuids(value, selfLower, targetSet) {
+  if (typeof value !== 'string' || !value) return;
+  const matches = value.match(UUID_GLOBAL_RE) || [];
+  for (const id of matches) {
+    const norm = id.toLowerCase();
+    if (norm !== selfLower) {
+      targetSet.add(norm);
+    }
+  }
 }
 
 function parseTranscript(appData, convId) {
@@ -228,8 +280,8 @@ function parseTranscript(appData, convId) {
   if (st.size < 0) return null;
 
   const key = `${st.mtime}:${st.size}`;
-  const cached = transcriptCache.get(fp);
-  if (cached && cached.key === key) return cached.parsed;
+  const cached = getCachedTranscript(fp, key);
+  if (cached) return cached;
 
   let text = '';
   try {
@@ -238,9 +290,11 @@ function parseTranscript(appData, convId) {
     return null;
   }
 
+  const selfLower = convId.toLowerCase();
   const calls = [];
   const subagentIds = new Set();
-  let sawSubagentTool = false;
+  // 记录当前 PLANNER_RESPONSE 派发后待匹配的工具响应队列（每项表示该响应是否属于委派类工具）
+  let pendingToolFlags = [];
 
   const lines = text.split('\n');
   for (const line of lines) {
@@ -269,27 +323,53 @@ function parseTranscript(appData, convId) {
           output,
         });
       }
+      pendingToolFlags = [];
       if (Array.isArray(obj.tool_calls)) {
         for (const tc of obj.tool_calls) {
-          if (tc?.name === 'invoke_subagent') {
-            sawSubagentTool = true;
+          const name = tc?.name;
+          const isDelegation = typeof name === 'string' && DELEGATION_TOOLS.has(name);
+          pendingToolFlags.push(isDelegation);
+          if (!isDelegation) continue;
+          // 从 send_message / manage_subagents 等工具入参直接提取关联子会话 ID
+          const args = tc?.args;
+          if (args && typeof args === 'object') {
+            if (name === 'send_message' && typeof args.Recipient === 'string') {
+              extractUuids(args.Recipient, selfLower, subagentIds);
+            } else if (name === 'manage_subagents' && args.ConversationIds !== undefined) {
+              extractUuids(
+                typeof args.ConversationIds === 'string' ? args.ConversationIds : JSON.stringify(args.ConversationIds),
+                selfLower,
+                subagentIds,
+              );
+            }
           }
         }
       }
-    } else if (sawSubagentTool && typeof obj.content === 'string') {
-      // Tool responses after invoke_subagent contain the child conversationId
-      if (obj.content.includes('conversationId') || obj.content.includes('conversation_id') || obj.content.includes('subagent')) {
-        const matches = obj.content.match(UUID_GLOBAL_RE) || [];
-        for (const id of matches) {
-          if (id.toLowerCase() !== convId.toLowerCase()) {
-            subagentIds.add(id);
-          }
+    } else if (obj.type === 'SYSTEM_MESSAGE' && typeof obj.content === 'string') {
+      // 匹配系统转发的 subagent / swarm / workflow 回传消息（例如 sender=<uuid>）
+      const senderMatches = obj.content.matchAll(/\bsender=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/gi);
+      for (const m of senderMatches) {
+        const norm = m[1].toLowerCase();
+        if (norm !== selfLower) subagentIds.add(norm);
+      }
+      if (DELEGATION_RESPONSE_HINT_RE.test(obj.content)) {
+        const refMatches = obj.content.matchAll(/(?:conversation:\/\/|conversationId["']?\s*[:=]\s*["']?)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/gi);
+        for (const m of refMatches) {
+          const norm = m[1].toLowerCase();
+          if (norm !== selfLower) subagentIds.add(norm);
         }
       }
+    } else if (pendingToolFlags.length > 0 && obj.type !== 'USER_INPUT') {
+      const isDelegationResp = pendingToolFlags.shift();
+      if (isDelegationResp && typeof obj.content === 'string' && DELEGATION_RESPONSE_HINT_RE.test(obj.content)) {
+        extractUuids(obj.content, selfLower, subagentIds);
+      }
+    } else if (obj.type === 'USER_INPUT') {
+      pendingToolFlags = [];
     }
   }
 
-  // Only keep subagentIds that actually have a transcript on disk
+  // 仅保留磁盘上真实存在 transcript.jsonl 的子会话，避免误关联
   const validSubagents = [];
   for (const sid of subagentIds) {
     if (existsSync(transcriptPath(appData, sid))) {
@@ -298,17 +378,14 @@ function parseTranscript(appData, convId) {
   }
 
   const parsed = {
-    convId,
+    convId: selfLower,
     key,
     mtime: st.mtime,
     calls,
     subagents: validSubagents,
   };
 
-  if (transcriptCache.size > 1000) {
-    transcriptCache.clear();
-  }
-  transcriptCache.set(fp, { key, parsed });
+  setCachedTranscript(fp, key, parsed);
   return parsed;
 }
 
@@ -353,28 +430,32 @@ function buildCurrentSnapshot(requestedConvId, pricing) {
     }
   }
 
+  const pHash = pricingHash(pricing);
+
   if (!appData || !convId) {
-    return { found: false, conversationId: requestedConvId || null, etag: `empty:${pricing.currency}:${pricing.cnyRate}` };
+    return { found: false, conversationId: requestedConvId || null, etag: `empty:${pHash}` };
   }
 
   const main = parseTranscript(appData, convId);
   if (!main) {
-    return { found: false, conversationId: convId, etag: `missing:${convId}:${pricing.currency}:${pricing.cnyRate}` };
+    return { found: false, conversationId: convId, etag: `missing:${convId.toLowerCase()}:${pHash}` };
   }
 
-  // Gather transitive subagents safely
-  const visited = new Set([convId]);
+  // Gather transitive subagents safely (case-insensitive dedupe)
+  const visited = new Set([convId.toLowerCase()]);
   const queue = [...main.subagents];
   const subParsed = [];
   while (queue.length) {
-    const sid = queue.shift();
+    const rawSid = queue.shift();
+    const sid = typeof rawSid === 'string' ? rawSid.toLowerCase() : '';
     if (!sid || visited.has(sid)) continue;
     visited.add(sid);
     const sp = parseTranscript(appData, sid);
     if (!sp) continue;
     subParsed.push(sp);
     for (const nextId of sp.subagents) {
-      if (!visited.has(nextId)) queue.push(nextId);
+      const nextNorm = typeof nextId === 'string' ? nextId.toLowerCase() : '';
+      if (nextNorm && !visited.has(nextNorm)) queue.push(nextNorm);
     }
   }
 
@@ -419,7 +500,7 @@ function buildCurrentSnapshot(requestedConvId, pricing) {
   const totalTokens = input + cache + output;
 
   const subKeys = subParsed.map((s) => `${s.convId}:${s.key}`).join(',');
-  const etag = `${convId}|${main.key}|${subKeys}|${pricing.currency}|${pricing.cnyRate}|${JSON.stringify(pricing.models[activeModel] || '')}`;
+  const etag = `${convId.toLowerCase()}|${main.key}|${subKeys}|${pHash}`;
 
   return {
     found: true,
@@ -460,10 +541,40 @@ function rangeStartMs(range) {
   return 0;
 }
 
-function buildOverviewSnapshot(range, pricing) {
+function buildOverviewSnapshot(range, pricing, requestedEtag = '') {
   const validRange = ['today', '7d', '30d', 'all'].includes(range) ? range : 'today';
   const minTs = rangeStartMs(validRange);
   const dirs = findAppDataDirs();
+
+  // 先扫描文件元数据生成轻量指纹，未变化时直接命中 ETag 或内存缓存
+  const entries = [];
+  const seenConvs = new Set();
+  const statParts = [];
+  for (const appData of dirs) {
+    const brainDir = join(appData, 'brain');
+    for (const entry of safeReaddir(brainDir)) {
+      if (!ID_RE.test(entry)) continue;
+      const norm = entry.toLowerCase();
+      if (seenConvs.has(norm)) continue;
+      seenConvs.add(norm);
+      const st = statOf(transcriptPath(appData, entry));
+      if (st.size <= 0) continue;
+      entries.push({ appData, entry });
+      statParts.push(`${norm}:${st.mtime}:${st.size}`);
+    }
+  }
+  statParts.sort();
+
+  const pHash = pricingHash(pricing);
+  const etag = shortHash(`${validRange}|${minTs}|${pHash}|${statParts.join(',')}`);
+  if (requestedEtag && requestedEtag === etag) {
+    return { unchanged: true, etag };
+  }
+
+  const cachedOverview = overviewCache.get(validRange);
+  if (cachedOverview && cachedOverview.etag === etag) {
+    return cachedOverview.snapshot;
+  }
 
   let totalInput = 0;
   let totalCache = 0;
@@ -474,57 +585,51 @@ function buildOverviewSnapshot(range, pricing) {
   let sessionCount = 0;
 
   const byModel = new Map(); // modelId -> { model, display, input, cache, output, total, costUsd, calls }
-  const seenConvs = new Set();
   const discoveredModels = new Set();
 
-  for (const appData of dirs) {
-    const brainDir = join(appData, 'brain');
-    for (const entry of safeReaddir(brainDir)) {
-      if (!ID_RE.test(entry) || seenConvs.has(entry)) continue;
-      seenConvs.add(entry);
-      const tr = parseTranscript(appData, entry);
-      if (!tr || !tr.calls.length) continue;
+  for (const { appData, entry } of entries) {
+    const tr = parseTranscript(appData, entry);
+    if (!tr || !tr.calls.length) continue;
 
-      let convMatched = false;
-      for (const c of tr.calls) {
-        discoveredModels.add(c.model);
-        if (minTs > 0 && c.ts < minTs) continue;
-        convMatched = true;
+    let convMatched = false;
+    for (const c of tr.calls) {
+      discoveredModels.add(c.model);
+      if (minTs > 0 && c.ts < minTs) continue;
+      convMatched = true;
 
-        const rule = ruleForModel(c.model, pricing);
-        const { cost, saved } = calcCostUsd(c.input, c.cache, c.output, rule);
+      const rule = ruleForModel(c.model, pricing);
+      const { cost, saved } = calcCostUsd(c.input, c.cache, c.output, rule);
 
-        totalInput += c.input;
-        totalCache += c.cache;
-        totalOutput += c.output;
-        totalCostUsd += cost;
-        totalSavedUsd += saved;
-        totalCalls += 1;
+      totalInput += c.input;
+      totalCache += c.cache;
+      totalOutput += c.output;
+      totalCostUsd += cost;
+      totalSavedUsd += saved;
+      totalCalls += 1;
 
-        let bucket = byModel.get(c.model);
-        if (!bucket) {
-          bucket = {
-            model: c.model,
-            display: formatModelName(c.model),
-            input: 0,
-            cache: 0,
-            output: 0,
-            total: 0,
-            costUsd: 0,
-            calls: 0,
-          };
-          byModel.set(c.model, bucket);
-        }
-        bucket.input += c.input;
-        bucket.cache += c.cache;
-        bucket.output += c.output;
-        bucket.total += c.input + c.cache + c.output;
-        bucket.costUsd += cost;
-        bucket.calls += 1;
+      let bucket = byModel.get(c.model);
+      if (!bucket) {
+        bucket = {
+          model: c.model,
+          display: formatModelName(c.model),
+          input: 0,
+          cache: 0,
+          output: 0,
+          total: 0,
+          costUsd: 0,
+          calls: 0,
+        };
+        byModel.set(c.model, bucket);
       }
-
-      if (convMatched) sessionCount += 1;
+      bucket.input += c.input;
+      bucket.cache += c.cache;
+      bucket.output += c.output;
+      bucket.total += c.input + c.cache + c.output;
+      bucket.costUsd += cost;
+      bucket.calls += 1;
     }
+
+    if (convMatched) sessionCount += 1;
   }
 
   const totalTokens = totalInput + totalCache + totalOutput;
@@ -538,8 +643,9 @@ function buildOverviewSnapshot(range, pricing) {
       pct: totalTokens > 0 ? (m.total / totalTokens) * 100 : 0,
     }));
 
-  return {
+  const snapshot = {
     range: validRange,
+    etag,
     totals: {
       totalTokens,
       input: totalInput,
@@ -556,6 +662,17 @@ function buildOverviewSnapshot(range, pricing) {
     currency: pricing.currency,
     cnyRate: pricing.cnyRate,
   };
+
+  if (overviewCache.has(validRange)) {
+    overviewCache.delete(validRange);
+  }
+  overviewCache.set(validRange, { etag, snapshot });
+  while (overviewCache.size > MAX_OVERVIEW_CACHE) {
+    const oldestKey = overviewCache.keys().next().value;
+    overviewCache.delete(oldestKey);
+  }
+
+  return snapshot;
 }
 
 function buildPricingResponse() {
@@ -621,7 +738,7 @@ async function start() {
       '/api/overview',
       (data) => {
         const pricing = loadPricing();
-        return buildOverviewSnapshot(data?.range || 'today', pricing);
+        return buildOverviewSnapshot(data?.range || 'today', pricing, data?.etag || '');
       },
       'GET',
     );
@@ -677,7 +794,9 @@ async function start() {
     }
     if (req.method === 'GET' && url.pathname === '/api/overview') {
       const pricing = loadPricing();
-      return send(200, buildOverviewSnapshot(url.searchParams.get('range') || 'today', pricing));
+      const range = url.searchParams.get('range') || 'today';
+      const etag = url.searchParams.get('etag') || '';
+      return send(200, buildOverviewSnapshot(range, pricing, etag));
     }
     if (req.method === 'GET' && url.pathname === '/api/pricing') {
       return send(200, buildPricingResponse());
@@ -710,4 +829,17 @@ async function start() {
   });
 }
 
-start();
+export {
+  buildCurrentSnapshot,
+  buildOverviewSnapshot,
+  buildPricingResponse,
+  loadPricing,
+  parseTranscript,
+  resetPricing,
+  savePricing,
+  start,
+};
+
+if (process.env.TOKEN_MONITOR_NO_START !== '1') {
+  start();
+}

@@ -1,11 +1,14 @@
 (() => {
-  const POLL_MS = 1800;
+  const CURRENT_POLL_MS = 1800;
+  const OVERVIEW_POLL_MS = 6000;
   const $ = (id) => document.getElementById(id);
 
   const state = {
     tab: 'current', // 'current' | 'overview'
     range: 'today', // 'today' | '7d' | '30d' | 'all'
     etag: '',
+    overviewEtag: '',
+    lastOverviewPollAt: 0,
     lastConv: '',
     pricingDraft: null,
     currencyDraft: 'USD',
@@ -201,18 +204,28 @@
     renderCurrent(data);
   }
 
-  async function pollOverview() {
-    const data = await apiFetch(`/api/overview?range=${encodeURIComponent(state.range)}`);
+  async function pollOverview(force = false) {
+    const now = Date.now();
+    if (!force && now - state.lastOverviewPollAt < OVERVIEW_POLL_MS) return;
+    state.lastOverviewPollAt = now;
+
+    const qs = new URLSearchParams({ range: state.range });
+    if (!force && state.overviewEtag) qs.set('etag', state.overviewEtag);
+
+    const data = await apiFetch(`/api/overview?${qs.toString()}`);
     $('live-dot').classList.remove('stale');
+    if (data.unchanged) return;
+    state.overviewEtag = data.etag || '';
     renderOverview(data);
   }
 
   async function tick(force = false) {
+    if (!force && document.hidden) return;
     try {
       if (state.tab === 'current') {
         await pollCurrent(force);
       } else {
-        await pollOverview();
+        await pollOverview(force);
       }
     } catch {
       $('live-dot').classList.add('stale');
@@ -237,8 +250,9 @@
   document.querySelectorAll('.range-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       state.range = btn.dataset.range || 'today';
+      state.overviewEtag = '';
       document.querySelectorAll('.range-btn').forEach((b) => b.classList.toggle('active', b === btn));
-      pollOverview().catch(() => {});
+      pollOverview(true).catch(() => {});
     });
   });
 
@@ -346,6 +360,7 @@
       });
       renderPricingDrawer(updated);
       state.etag = '';
+      state.overviewEtag = '';
       $('save-toast').classList.remove('hidden');
       tick(true);
       setTimeout(() => $('save-toast').classList.add('hidden'), 1800);
@@ -363,6 +378,7 @@
       });
       renderPricingDrawer(updated);
       state.etag = '';
+      state.overviewEtag = '';
       $('save-toast').textContent = '已恢复默认';
       $('save-toast').classList.remove('hidden');
       tick(true);
@@ -375,7 +391,11 @@
     }
   });
 
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) tick(true);
+  });
+
   // Initial load + live polling
   tick(true);
-  setInterval(() => tick(false), POLL_MS);
+  setInterval(() => tick(false), CURRENT_POLL_MS);
 })();
