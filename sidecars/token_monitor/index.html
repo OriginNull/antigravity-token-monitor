@@ -93,6 +93,23 @@
             <span class="legend-item"><i class="dot seg-output"></i>输出 <span id="pct-output" class="mono">0%</span></span>
           </div>
         </section>
+
+        <!-- Per-Request Live Feed -->
+        <section class="card">
+          <div class="calls-head">
+            <div class="calls-title-wrap">
+              <span class="label">实时请求</span>
+              <span id="cur-calls-meta" class="calls-meta">0 次</span>
+            </div>
+            <div id="calls-filter" class="mini-seg hidden" role="group" aria-label="请求来源筛选">
+              <button type="button" class="mini-seg-btn active" data-filter="all">全部</button>
+              <button type="button" class="mini-seg-btn" data-filter="main">仅主对话</button>
+            </div>
+          </div>
+          <div id="cur-calls-list" class="call-list">
+            <div class="empty-inline">暂无请求记录</div>
+          </div>
+        </section>
       </div>
     </main>
 
@@ -131,6 +148,20 @@
             <span id="ov-saved" class="kpi-sub ok-text">缓存共省 $0.00</span>
           </div>
           <div id="ov-models" class="model-list">
+            <div class="empty-inline">该时间段暂无调用记录</div>
+          </div>
+        </section>
+
+        <!-- Global Per-Request Live Feed -->
+        <section class="card">
+          <div class="calls-head">
+            <div class="calls-title-wrap">
+              <span class="label">实时请求</span>
+              <span id="ov-calls-meta" class="calls-meta">0 次</span>
+            </div>
+            <span class="calls-meta">跨会话</span>
+          </div>
+          <div id="ov-calls-list" class="call-list">
             <div class="empty-inline">该时间段暂无调用记录</div>
           </div>
         </section>

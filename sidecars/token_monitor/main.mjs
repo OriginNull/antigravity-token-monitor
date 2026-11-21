@@ -21,6 +21,7 @@ const DELEGATION_TOOLS = new Set(['invoke_subagent', 'send_message', 'manage_sub
 const DELEGATION_RESPONSE_HINT_RE = /conversationId|conversation_id|conversation:\/\/|subagent|swarm|worker|workflow/i;
 const MAX_TRANSCRIPT_CACHE = 1000;
 const MAX_OVERVIEW_CACHE = 8;
+const MAX_RECENT_CALLS = 80;
 
 const STATIC_FILES = {
   '/styles.css': ['styles.css', 'text/css; charset=utf-8'],
@@ -466,9 +467,13 @@ function buildCurrentSnapshot(requestedConvId, pricing) {
   let costUsd = 0;
   let savedUsd = 0;
   const modelsSeen = new Set();
+  const allCalls = [];
+  let seq = 0;
 
-  const accumulate = (tr) => {
-    for (const c of tr.calls) {
+  const accumulate = (tr, isSubagent) => {
+    let prevCtx = null;
+    for (let i = 0; i < tr.calls.length; i += 1) {
+      const c = tr.calls[i];
       input += c.input;
       cache += c.cache;
       output += c.output;
@@ -478,13 +483,41 @@ function buildCurrentSnapshot(requestedConvId, pricing) {
       const { cost, saved } = calcCostUsd(c.input, c.cache, c.output, rule);
       costUsd += cost;
       savedUsd += saved;
+
+      const ctxNow = c.input + c.cache;
+      const contextDelta = prevCtx !== null ? ctxNow - prevCtx : null;
+      prevCtx = ctxNow;
+
+      allCalls.push({
+        id: `${tr.convId}:${c.step}:${i}`,
+        ts: c.ts,
+        step: c.step,
+        seq: seq++,
+        isSubagent,
+        convShort: tr.convId.slice(0, 6),
+        model: c.model,
+        modelDisplay: formatModelName(c.model),
+        input: c.input,
+        cache: c.cache,
+        output: c.output,
+        total: c.input + c.cache + c.output,
+        cacheHitRate: ctxNow > 0 ? (c.cache / ctxNow) * 100 : 0,
+        costUsd: cost,
+        contextDelta,
+      });
     }
   };
 
-  accumulate(main);
+  accumulate(main, false);
   for (const sp of subParsed) {
-    accumulate(sp);
+    accumulate(sp, true);
   }
+
+  // 按时间倒序排列（同时间戳下按 step / 原始顺序倒序），保留最近 MAX_RECENT_CALLS 条
+  allCalls.sort((a, b) => b.ts - a.ts || b.step - a.step || b.seq - a.seq);
+  const recentCalls = allCalls.slice(0, MAX_RECENT_CALLS).map(({ seq: _seq, ...item }) => item);
+  const mainCallCount = main.calls.length;
+  const subagentCallCount = callCount - mainCallCount;
 
   const lastCall = main.calls.length ? main.calls[main.calls.length - 1] : null;
   const activeModel = lastCall?.model || [...modelsSeen][0] || 'unknown';
@@ -522,11 +555,14 @@ function buildCurrentSnapshot(requestedConvId, pricing) {
       cache,
       output,
       callCount,
+      mainCallCount,
+      subagentCallCount,
       subagentCount: subParsed.length,
       cacheHitRate,
       costUsd,
       savedUsd,
     },
+    recentCalls,
     currency: pricing.currency,
     cnyRate: pricing.cnyRate,
   };
@@ -586,13 +622,24 @@ function buildOverviewSnapshot(range, pricing, requestedEtag = '') {
 
   const byModel = new Map(); // modelId -> { model, display, input, cache, output, total, costUsd, calls }
   const discoveredModels = new Set();
+  let recentPool = [];
+  let recentCutoffTs = -Infinity;
+  let seq = 0;
+
+  const sortRecent = (a, b) => b.ts - a.ts || b.step - a.step || b.seq - a.seq;
 
   for (const { appData, entry } of entries) {
     const tr = parseTranscript(appData, entry);
     if (!tr || !tr.calls.length) continue;
 
     let convMatched = false;
-    for (const c of tr.calls) {
+    let prevCtx = null;
+    for (let i = 0; i < tr.calls.length; i += 1) {
+      const c = tr.calls[i];
+      const ctxNow = c.input + c.cache;
+      const contextDelta = prevCtx !== null ? ctxNow - prevCtx : null;
+      prevCtx = ctxNow;
+
       discoveredModels.add(c.model);
       if (minTs > 0 && c.ts < minTs) continue;
       convMatched = true;
@@ -627,10 +674,38 @@ function buildOverviewSnapshot(range, pricing, requestedEtag = '') {
       bucket.total += c.input + c.cache + c.output;
       bucket.costUsd += cost;
       bucket.calls += 1;
+
+      if (c.ts >= recentCutoffTs) {
+        recentPool.push({
+          id: `${tr.convId}:${c.step}:${i}`,
+          ts: c.ts,
+          step: c.step,
+          seq: seq++,
+          convId: tr.convId,
+          convShort: tr.convId.slice(0, 6),
+          model: c.model,
+          modelDisplay: formatModelName(c.model),
+          input: c.input,
+          cache: c.cache,
+          output: c.output,
+          total: c.input + c.cache + c.output,
+          cacheHitRate: ctxNow > 0 ? (c.cache / ctxNow) * 100 : 0,
+          costUsd: cost,
+          contextDelta,
+        });
+        if (recentPool.length > MAX_RECENT_CALLS * 4) {
+          recentPool.sort(sortRecent);
+          recentPool = recentPool.slice(0, MAX_RECENT_CALLS);
+          recentCutoffTs = recentPool[recentPool.length - 1].ts;
+        }
+      }
     }
 
     if (convMatched) sessionCount += 1;
   }
+
+  recentPool.sort(sortRecent);
+  const recentCalls = recentPool.slice(0, MAX_RECENT_CALLS).map(({ seq: _seq, ...item }) => item);
 
   const totalTokens = totalInput + totalCache + totalOutput;
   const totalInAll = totalInput + totalCache;
@@ -658,6 +733,7 @@ function buildOverviewSnapshot(range, pricing, requestedEtag = '') {
       savedUsd: totalSavedUsd,
     },
     models,
+    recentCalls,
     discoveredModels: [...discoveredModels].sort(),
     currency: pricing.currency,
     cnyRate: pricing.cnyRate,

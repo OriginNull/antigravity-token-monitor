@@ -1,15 +1,21 @@
 (() => {
   const CURRENT_POLL_MS = 1800;
-  const OVERVIEW_POLL_MS = 6000;
+  const OVERVIEW_POLL_MS = 3000;
   const $ = (id) => document.getElementById(id);
 
   const state = {
     tab: 'current', // 'current' | 'overview'
     range: 'today', // 'today' | '7d' | '30d' | 'all'
+    callFilter: 'all', // 'all' | 'main'
     etag: '',
     overviewEtag: '',
     lastOverviewPollAt: 0,
     lastConv: '',
+    lastCurrentData: null,
+    seenCallConv: '',
+    seenCallIds: new Set(),
+    seenOverviewRange: '',
+    seenOverviewCallIds: new Set(),
     pricingDraft: null,
     currencyDraft: 'USD',
   };
@@ -90,16 +96,147 @@
     return `${n.toFixed(1)}%`;
   }
 
+  function fmtTime(ts, withDateIfNotToday = false) {
+    const d = new Date(Number(ts));
+    if (!Number.isFinite(d.getTime())) return '--:--:--';
+    const pad = (v) => String(v).padStart(2, '0');
+    if (withDateIfNotToday) {
+      const now = new Date();
+      const sameDay =
+        d.getFullYear() === now.getFullYear() &&
+        d.getMonth() === now.getMonth() &&
+        d.getDate() === now.getDate();
+      if (!sameDay) {
+        return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+      }
+    }
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  function fmtDelta(delta) {
+    if (delta === null || delta === undefined || !Number.isFinite(Number(delta))) return '';
+    const n = Math.round(Number(delta));
+    if (n === 0) return 'Ctx 0';
+    return `${n > 0 ? 'Ctx +' : 'Ctx -'}${fmtTokens(Math.abs(n))}`;
+  }
+
+  function fmtDeltaTitle(delta) {
+    if (delta === null || delta === undefined || !Number.isFinite(Number(delta))) return '';
+    const n = Math.round(Number(delta));
+    const signed = n === 0 ? '0' : `${n > 0 ? '+' : '-'}${fmtTokens(Math.abs(n))}`;
+    return `较同会话上次请求上下文变化：${signed} Token`;
+  }
+
   const esc = (s) =>
     String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  function applyCallFilterButtons() {
+    document.querySelectorAll('#calls-filter .mini-seg-btn').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.filter === state.callFilter);
+    });
+  }
+
+  function renderRecentCalls(data, animateNew = true) {
+    const listEl = $('cur-calls-list');
+    const metaEl = $('cur-calls-meta');
+    const filterEl = $('calls-filter');
+    if (!listEl || !metaEl || !filterEl) return;
+
+    if (!Array.isArray(data.recentCalls)) {
+      filterEl.classList.add('hidden');
+      metaEl.textContent = '需重载';
+      listEl.innerHTML = '<div class="empty-inline">后端进程为旧版本，请在插件管理中关闭再开启以生效</div>';
+      return;
+    }
+
+    const allCalls = data.recentCalls;
+    const hasSubCalls = (data.totals?.subagentCallCount || 0) > 0 || allCalls.some((c) => c.isSubagent);
+    filterEl.classList.toggle('hidden', !hasSubCalls);
+    if (!hasSubCalls && state.callFilter !== 'all') {
+      state.callFilter = 'all';
+    }
+    applyCallFilterButtons();
+
+    // 识别同一对话中新到达的请求，用于在列表顶部触发微高亮动效
+    const convId = data.conversationId || '';
+    const isSameConv = Boolean(convId && convId === state.seenCallConv);
+    const newlyArrived = new Set();
+    if (animateNew && isSameConv) {
+      for (const c of allCalls) {
+        if (c.id && !state.seenCallIds.has(c.id)) {
+          newlyArrived.add(c.id);
+        }
+      }
+    }
+    if (convId !== state.seenCallConv) {
+      state.seenCallConv = convId;
+      state.seenCallIds = new Set(allCalls.map((c) => c.id).filter(Boolean));
+    } else {
+      for (const c of allCalls) {
+        if (c.id) state.seenCallIds.add(c.id);
+      }
+    }
+
+    const filtered = state.callFilter === 'main' ? allCalls.filter((c) => !c.isSubagent) : allCalls;
+    const totalExpected =
+      state.callFilter === 'main'
+        ? data.totals?.mainCallCount ?? filtered.length
+        : data.totals?.callCount ?? filtered.length;
+
+    metaEl.textContent =
+      filtered.length < totalExpected ? `最近 ${filtered.length} / ${totalExpected} 次` : `${totalExpected} 次`;
+
+    if (!filtered.length) {
+      listEl.innerHTML = '<div class="empty-inline">暂无请求记录</div>';
+      return;
+    }
+
+    const { currency, cnyRate, model: activeModel } = data;
+    listEl.innerHTML = filtered
+      .map((c) => {
+        const isNew = newlyArrived.has(c.id);
+        const showModel = c.model && c.model !== activeModel;
+        const deltaText = fmtDelta(c.contextDelta);
+        const deltaClass = c.contextDelta !== null && c.contextDelta < 0 ? 'call-delta down' : 'call-delta';
+        const hitPct = Math.round(Number(c.cacheHitRate) || 0);
+        const subTitle = c.isSubagent ? `子助手 ${c.convShort || ''} · ${c.modelDisplay || c.model}` : c.modelDisplay || c.model;
+
+        return `
+          <div class="call-item${isNew ? ' call-new' : ''}" title="${esc(subTitle)}">
+            <div class="call-row-top">
+              <div class="call-left">
+                <span class="call-time">${fmtTime(c.ts)}</span>
+                ${c.isSubagent ? '<span class="call-badge">子</span>' : ''}
+                ${showModel ? `<span class="call-model">${esc(c.modelDisplay || c.model)}</span>` : ''}
+              </div>
+              <div class="call-right">
+                <span class="call-total">${fmtTokens(c.total)}</span>
+                <span class="call-cost">${fmtMoney(c.costUsd, currency, cnyRate)}</span>
+              </div>
+            </div>
+            <div class="call-row-sub">
+              <div class="call-breakdown">
+                <span class="call-part"><i class="dot seg-input"></i>In ${fmtTokens(c.input)}</span>
+                <span class="call-part"><i class="dot seg-cache"></i>Cache ${fmtTokens(c.cache)}${c.cache > 0 ? ` (${hitPct}%)` : ''}</span>
+                <span class="call-part"><i class="dot seg-output"></i>Out ${fmtTokens(c.output)}</span>
+              </div>
+              ${deltaText ? `<span class="${deltaClass}" title="${esc(fmtDeltaTitle(c.contextDelta))}">${deltaText}</span>` : ''}
+            </div>
+          </div>
+        `;
+      })
+      .join('');
+  }
 
   // ---------- Render: Current Session ----------
   function renderCurrent(data) {
     if (!data || !data.found) {
+      state.lastCurrentData = null;
       $('cur-empty').classList.remove('hidden');
       $('cur-content').classList.add('hidden');
       return;
     }
+    state.lastCurrentData = data;
     $('cur-empty').classList.add('hidden');
     $('cur-content').classList.remove('hidden');
 
@@ -148,6 +285,8 @@
     $('pct-cache').textContent = `${Math.round(pCache)}%`;
     $('pct-input').textContent = `${Math.round(pInput)}%`;
     $('pct-output').textContent = `${Math.round(pOutput)}%`;
+
+    renderRecentCalls(data, true);
   }
 
   // ---------- Render: Global Overview ----------
@@ -163,21 +302,98 @@
     const container = $('ov-models');
     if (!models || !models.length) {
       container.innerHTML = '<div class="empty-inline">该时间段暂无调用记录</div>';
+    } else {
+      container.innerHTML = models
+        .map((m, idx) => {
+          const color = MODEL_COLORS[idx % MODEL_COLORS.length];
+          const width = Math.max(2, Math.min(100, m.pct));
+          return `
+            <div class="model-item">
+              <div class="model-head">
+                <span class="model-name" title="${esc(m.model)}">${esc(m.display)}</span>
+                <span class="model-nums">${fmtTokens(m.total)} · ${fmtMoney(m.costUsd, currency, cnyRate)} (${Math.round(m.pct)}%)</span>
+              </div>
+              <div class="model-bar-track">
+                <div class="model-bar-fill" style="width:${width.toFixed(1)}%; background:${color}"></div>
+              </div>
+            </div>
+          `;
+        })
+        .join('');
+    }
+
+    renderOverviewCalls(data);
+  }
+
+  function renderOverviewCalls(data) {
+    const listEl = $('ov-calls-list');
+    const metaEl = $('ov-calls-meta');
+    if (!listEl || !metaEl) return;
+
+    if (!Array.isArray(data.recentCalls)) {
+      metaEl.textContent = '需重载';
+      listEl.innerHTML = '<div class="empty-inline">后端进程为旧版本，请在插件管理中关闭再开启以生效</div>';
       return;
     }
 
-    container.innerHTML = models
-      .map((m, idx) => {
-        const color = MODEL_COLORS[idx % MODEL_COLORS.length];
-        const width = Math.max(2, Math.min(100, m.pct));
+    const calls = data.recentCalls;
+    const totalExpected = data.totals?.callCount ?? calls.length;
+    metaEl.textContent =
+      calls.length < totalExpected ? `最近 ${calls.length} / ${totalExpected} 次` : `${totalExpected} 次`;
+
+    const rangeKey = data.range || state.range;
+    const sameRange = rangeKey === state.seenOverviewRange;
+    const newlyArrived = new Set();
+    if (sameRange) {
+      for (const c of calls) {
+        if (c.id && !state.seenOverviewCallIds.has(c.id)) {
+          newlyArrived.add(c.id);
+        }
+      }
+      for (const c of calls) {
+        if (c.id) state.seenOverviewCallIds.add(c.id);
+      }
+    } else {
+      state.seenOverviewRange = rangeKey;
+      state.seenOverviewCallIds = new Set(calls.map((c) => c.id).filter(Boolean));
+    }
+
+    if (!calls.length) {
+      listEl.innerHTML = '<div class="empty-inline">该时间段暂无调用记录</div>';
+      return;
+    }
+
+    const { currency, cnyRate } = data;
+    const activeConv = (currentConvId() || '').toLowerCase();
+    listEl.innerHTML = calls
+      .map((c) => {
+        const isNew = newlyArrived.has(c.id);
+        const isCur = Boolean(activeConv && c.convId && c.convId.toLowerCase() === activeConv);
+        const deltaText = fmtDelta(c.contextDelta);
+        const deltaClass = c.contextDelta !== null && c.contextDelta < 0 ? 'call-delta down' : 'call-delta';
+        const hitPct = Math.round(Number(c.cacheHitRate) || 0);
+        const title = `${c.modelDisplay || c.model} · 会话 ${c.convShort || ''}`;
+
         return `
-          <div class="model-item">
-            <div class="model-head">
-              <span class="model-name" title="${esc(m.model)}">${esc(m.display)}</span>
-              <span class="model-nums">${fmtTokens(m.total)} · ${fmtMoney(m.costUsd, currency, cnyRate)} (${Math.round(m.pct)}%)</span>
+          <div class="call-item${isNew ? ' call-new' : ''}" title="${esc(title)}">
+            <div class="call-row-top">
+              <div class="call-left">
+                <span class="call-time">${fmtTime(c.ts, true)}</span>
+                ${isCur ? '<span class="call-badge cur">当前</span>' : ''}
+                <span class="call-model">${esc(c.modelDisplay || c.model)}</span>
+              </div>
+              <div class="call-right">
+                <span class="call-total">${fmtTokens(c.total)}</span>
+                <span class="call-cost">${fmtMoney(c.costUsd, currency, cnyRate)}</span>
+              </div>
             </div>
-            <div class="model-bar-track">
-              <div class="model-bar-fill" style="width:${width.toFixed(1)}%; background:${color}"></div>
+            <div class="call-row-sub">
+              <div class="call-breakdown">
+                <span class="call-part"><i class="dot seg-input"></i>In ${fmtTokens(c.input)}</span>
+                <span class="call-part"><i class="dot seg-cache"></i>Cache ${fmtTokens(c.cache)}${c.cache > 0 ? ` (${hitPct}%)` : ''}</span>
+                <span class="call-part"><i class="dot seg-output"></i>Out ${fmtTokens(c.output)}</span>
+              </div>
+              ${deltaText ? `<span class="${deltaClass}" title="${esc(fmtDeltaTitle(c.contextDelta))}">${deltaText}</span>` : ''}
             </div>
           </div>
         `;
@@ -191,6 +407,7 @@
     if (conv !== state.lastConv) {
       state.lastConv = conv;
       state.etag = '';
+      state.callFilter = 'all';
       force = true;
     }
     const qs = new URLSearchParams();
@@ -246,6 +463,19 @@
 
   $('tab-current').addEventListener('click', () => switchTab('current'));
   $('tab-overview').addEventListener('click', () => switchTab('overview'));
+
+  document.querySelectorAll('#calls-filter .mini-seg-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const next = btn.dataset.filter === 'main' ? 'main' : 'all';
+      if (next === state.callFilter) return;
+      state.callFilter = next;
+      if (state.lastCurrentData) {
+        renderRecentCalls(state.lastCurrentData, false);
+      } else {
+        applyCallFilterButtons();
+      }
+    });
+  });
 
   document.querySelectorAll('.range-btn').forEach((btn) => {
     btn.addEventListener('click', () => {

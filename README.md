@@ -17,19 +17,19 @@
     <td align="center" width="50%">
       <img src="assets/preview-current-light.png" alt="当前对话视图（浅色主题）" width="100%" />
       <br />
-      <sub><b>当前对话（浅色主题 · 人民币）</b><br />上下文占用进度条、2×2 核心指标、子助手统计与 Token 构成</sub>
+      <sub><b>当前对话（浅色主题 · 人民币）</b><br />上下文进度条、2×2 核心指标、Token 构成与逐次实时请求明细</sub>
     </td>
     <td align="center" width="50%">
       <img src="assets/preview-current-dark.png" alt="当前对话视图（深色主题 · 高占用预警）" width="100%" />
       <br />
-      <sub><b>当前对话（深色主题 · 美元 · 占用预警）</b><br />自动同步宿主深色主题，超 70% / 90% 智能预警提醒</sub>
+      <sub><b>当前对话（深色主题 · 美元 · 占用预警）</b><br />自动同步宿主深色主题，超 70% / 90% 预警与上下文变化追踪</sub>
     </td>
   </tr>
   <tr>
     <td align="center" width="50%">
       <img src="assets/preview-overview-light.png" alt="全局总览视图" width="100%" />
       <br />
-      <sub><b>全局总览（分周期 & 分模型排行）</b><br />今日 / 7天 / 30天 / 全部统计、平均缓存率与缓存累计节省</sub>
+      <sub><b>全局总览（分周期 · 分模型排行 · 跨会话实时请求）</b><br />今日 / 7天 / 30天 / 全部统计、平均缓存率与跨会话逐次调用流</sub>
     </td>
     <td align="center" width="50%">
       <img src="assets/preview-settings-light.png" alt="单价与币种设置抽屉" width="100%" />
@@ -67,9 +67,9 @@
 
 ## 功能特性
 
-- **当前对话实时监控**：自动跟随当前激活的对话（约 1.8 秒轮询 + ETag 增量比对），实时展示上下文窗口占用进度条、模型状态预警、累计 Token、估算费用、缓存节省金额、缓存命中率、新输入/输出明细与 Token 构成比例。
-- **子助手（Subagent）消耗聚合**：自动识别并递归汇总当前会话中通过 `invoke_subagent` 派生的子助手 Token 与费用消耗。
-- **全局总览统计**：支持按 **今日 / 7天 / 30天 / 全部** 切换时间范围，查看跨会话总消耗 Token、对话数、调用次数、总估算费用、平均缓存命中率以及分模型消耗排行。
+- **当前对话实时监控**：自动跟随当前激活的对话（约 1.8 秒轮询 + ETag 增量比对），实时展示上下文窗口占用进度条、模型状态预警、累计 Token、估算费用、缓存节省金额、缓存命中率、新输入/输出明细、Token 构成比例与**逐次实时请求消耗流**。
+- **子助手 / Swarm 消耗聚合**：自动识别并递归汇总当前会话中通过 `invoke_subagent`、`swarm`、`run_workflow`、`send_message` 等派生的子会话 Token 与费用消耗，支持在实时请求列表中按 `全部 / 仅主对话` 筛选。
+- **全局总览统计**：支持按 **今日 / 7天 / 30天 / 全部** 切换时间范围（约 3 秒轮询 + ETag 缓存），查看跨会话总消耗 Token、对话数、调用次数、总估算费用、平均缓存命中率、分模型消耗排行以及**跨会话实时请求流**。
 - **自定义单价与币种**：内置设置抽屉，支持自定义各模型的上下文上限与输入/缓存/输出单价，并支持在 **美元 (`$`)** 与 **人民币 (`¥`)** 之间一键切换与自定义汇率。
 - **宿主主题自适应**：通过 Antigravity `/preload.js` 自动同步宿主界面的浅色 / 深色主题，视觉无缝融合。
 - **零外部依赖 & 纯本地只读**：后端仅使用 Node.js 原生标准库，前端为纯原生 HTML/CSS/JS，无需 `npm install`，无任何外部网络请求。
@@ -159,6 +159,7 @@ ln -s /path/to/antigravity-token-monitor ~/.gemini/config/plugins/antigravity-to
   - **缓存命中率**：计算公式为 `缓存读取 / (新输入 + 缓存读取)`，下方显示缓存命中的 Token 总量。
   - **新输入 / 输出**：分别展示非缓存新输入 Token 与模型输出 Token，下方显示聚合的关联子助手数量。
 - **Token 构成比例条**：以三段式色条直观呈现 `缓存`、`新输入`、`输出` 三类 Token 的占比分布。
+- **实时请求明细**：按时间倒序展示最近 80 次请求的逐笔消耗，突出本次总 Token 与单次费用，并拆解 `In` / `Cache (命中率)` / `Out` 及相对同会话上次请求的上下文净变化量（`Ctx +xxx` / 压缩后绿字显示 `Ctx -xxx`）；存在子助手调用时支持一键切换 `全部 / 仅主对话`。
 
 ### 全局总览视图
 
@@ -167,6 +168,7 @@ ln -s /path/to/antigravity-token-monitor ~/.gemini/config/plugins/antigravity-to
 - **统计周期切换**：支持一键切换 `今日`、`7天`、`30天`、`全部`。
 - **汇总卡片**：展示所选周期内的总消耗 Token、对话数、总调用次数、总估算费用与平均缓存命中率。
 - **分模型消耗排行**：按总 Token 消耗降序展示各个模型的 Token 数量、估算费用、占比进度条，并在标题右侧汇总周期内缓存共节省金额。
+- **跨会话实时请求**：实时汇总所选周期内跨全部对话的逐次请求消耗，自动标注当前对话（`当前` 徽标）、模型名、`In / Cache / Out` 明细与上下文净变化量（`Ctx +/-`）。
 
 ### 自定义单价、上下文上限与币种
 
@@ -258,8 +260,8 @@ antigravity-token-monitor/
 
 | 方法与路径 | 说明 |
 | :--- | :--- |
-| `GET /api/current?conversationId=<id>&etag=<etag>` | 获取当前对话及子助手的上下文占用与 Token 快照；数据未变化时返回 `{ "unchanged": true }` |
-| `GET /api/overview?range=today\|7d\|30d\|all` | 获取指定周期的全局汇总指标与分模型统计 |
+| `GET /api/current?conversationId=<id>&etag=<etag>` | 获取当前对话及子会话的上下文占用、Token 汇总与逐次实时请求快照；数据未变化时返回 `{ "unchanged": true }` |
+| `GET /api/overview?range=today\|7d\|30d\|all&etag=<etag>` | 获取指定周期的全局汇总指标、分模型统计与跨会话实时请求流；数据未变化时返回 `{ "unchanged": true }` |
 | `GET /api/pricing` | 获取当前币种、汇率、兜底规则及所有预置/本机已用模型单价 |
 | `POST /api/pricing` | 保存自定义单价与币种配置；传入 `{ "reset": true }` 恢复默认配置 |
 
@@ -272,7 +274,7 @@ antigravity-token-monitor/
   <appData>/brain/<conversationId>/.system_generated/logs/transcript.jsonl
   ```
   绝不会修改、删除或干扰任何对话数据。
-- **高性能低开销**：后端基于文件的 `mtime + size` 维护内存解析缓存（超过 1000 条自动清理），前端配合 `ETag` 进行差异轮询，空闲时几乎零 CPU 占用。
+- **高性能低开销**：后端基于文件的 `mtime + size` 维护 LRU 内存解析缓存（上限 1000 条）与全局总览聚合缓存，前端在当前对话与全局总览均配合 `ETag` 进行差异轮询并在页面隐藏时暂停轮询，空闲时几乎零 CPU 占用。
 - **配置持久化路径**：
   - 在 Antigravity Sidecar 模式下，自定义单价保存在 `<ANTIGRAVITY_EXECUTABLE_DATA_DIR>/pricing.json`。
   - 在独立运行模式下，保存在 `sidecars/token_monitor/pricing.json`。
