@@ -8,8 +8,42 @@
 
 ---
 
+## 界面预览
+
+> 以下为插件真实界面渲染效果（使用示例数据展示，支持浅色 / 深色主题自动同步与 `$` / `¥` 币种切换）：
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="assets/preview-current-light.png" alt="当前对话视图（浅色主题）" width="100%" />
+      <br />
+      <sub><b>当前对话（浅色主题 · 人民币）</b><br />上下文占用进度条、2×2 核心指标、子助手统计与 Token 构成</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="assets/preview-current-dark.png" alt="当前对话视图（深色主题 · 高占用预警）" width="100%" />
+      <br />
+      <sub><b>当前对话（深色主题 · 美元 · 占用预警）</b><br />自动同步宿主深色主题，超 70% / 90% 智能预警提醒</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="assets/preview-overview-light.png" alt="全局总览视图" width="100%" />
+      <br />
+      <sub><b>全局总览（分周期 & 分模型排行）</b><br />今日 / 7天 / 30天 / 全部统计、平均缓存率与缓存累计节省</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="assets/preview-settings-light.png" alt="单价与币种设置抽屉" width="100%" />
+      <br />
+      <sub><b>单价与币种设置抽屉</b><br />自动识别本机已用模型，支持自定义单价、上下文上限与汇率</sub>
+    </td>
+  </tr>
+</table>
+
+---
+
 ## 目录
 
+- [界面预览](#界面预览)
 - [功能特性](#功能特性)
 - [环境要求](#环境要求)
 - [安装指南](#安装指南)
@@ -200,7 +234,11 @@ http://127.0.0.1:3456
 antigravity-token-monitor/
 ├── plugin.json                              # Antigravity 插件清单
 ├── assets/
-│   └── logo.svg                             # 插件图标
+│   ├── logo.svg                             # 插件图标
+│   ├── preview-current-light.png            # 界面预览：当前对话（浅色）
+│   ├── preview-current-dark.png             # 界面预览：当前对话（深色）
+│   ├── preview-overview-light.png           # 界面预览：全局总览
+│   └── preview-settings-light.png           # 界面预览：单价与币种设置
 ├── skills/
 │   └── antigravity-token-monitor/
 │       └── SKILL.md                         # 配套 Skill（对话唤起侧边栏链接）
