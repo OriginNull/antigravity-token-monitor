@@ -8,7 +8,7 @@
  *   <ANTIGRAVITY_EXECUTABLE_DATA_DIR>/pricing.json (or alongside main.mjs standalone)
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, watch, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -23,7 +23,8 @@ const MAX_TRANSCRIPT_CACHE = 1000;
 const MAX_OVERVIEW_CACHE = 8;
 const MAX_RECENT_CALLS = 80;
 const MAX_TIMING_ENTRIES = 4000;
-const MIN_DURATION_MS = 400;
+const MIN_DURATION_MS = 150;
+const MIN_AVG_DURATION_MS = 400;
 const MAX_DURATION_MS = 180_000;
 const MAX_AVG_DURATION_MS = 120_000;
 const MIN_AVG_OUTPUT_TOKENS = 20;
@@ -171,11 +172,12 @@ function calcStepTps(output, durationMs) {
   return tps;
 }
 
-function isAvgSpeedSample(output, durationMs, tps) {
+function isAvgSpeedSample(output, durationMs, tps, estimated = false) {
   return (
+    !estimated &&
     tps !== null &&
     output >= MIN_AVG_OUTPUT_TOKENS &&
-    durationMs >= MIN_DURATION_MS &&
+    durationMs >= MIN_AVG_DURATION_MS &&
     durationMs <= MAX_AVG_DURATION_MS
   );
 }
@@ -383,6 +385,26 @@ function parseTranscript(appData, convId) {
   let pendingDurationHasTools = false;
   let lastRecordCall = null;
 
+  const resolvePendingByNextTs = (nextTs) => {
+    if (!pendingDurationCall || pendingDurationCall.durationMs !== null || pendingDurationCall.rawTs === null) {
+      return;
+    }
+    if (!Number.isFinite(nextTs)) return;
+    const dt = Math.round(nextTs - pendingDurationCall.rawTs);
+    if (dt >= MIN_DURATION_MS && dt <= MAX_DURATION_MS) {
+      pendingDurationCall.durationMs = dt;
+    } else if (
+      dt >= 0 &&
+      dt < MIN_DURATION_MS &&
+      pendingDurationHasTools &&
+      pendingDurationCall.output > 0 &&
+      pendingDurationCall.output <= 500
+    ) {
+      // ISO 时间戳精度为整秒，极快工具调用与下一条 GENERIC 同秒时兜底 1s（不计入均速分母）
+      pendingDurationCall.fallbackDurationMs = 1000;
+    }
+  };
+
   const lines = text.split('\n');
   for (const line of lines) {
     const trimmed = line.trim();
@@ -401,6 +423,9 @@ function parseTranscript(appData, convId) {
       const model = typeof obj.model === 'string' && obj.model ? obj.model : 'unknown';
       const rawTs = typeof obj.created_at === 'string' ? Date.parse(obj.created_at) : NaN;
       const hasTools = Array.isArray(obj.tool_calls) && obj.tool_calls.length > 0;
+
+      // 若两条 PLANNER_RESPONSE 连续出现（无人工等待），用下一条开始时间推导前一条耗时
+      resolvePendingByNextTs(rawTs);
       pendingDurationCall = null;
       pendingDurationHasTools = false;
       lastRecordCall = null;
@@ -415,6 +440,8 @@ function parseTranscript(appData, convId) {
           cache,
           output,
           durationMs: null,
+          fallbackDurationMs: null,
+          durationEstimated: false,
           tps: null,
         };
         calls.push(callItem);
@@ -446,15 +473,10 @@ function parseTranscript(appData, convId) {
       }
     } else {
       lastRecordCall = null;
-      // 带工具调用的 PLANNER_RESPONSE 紧随其后的首条 GENERIC 记录其开始执行时间戳，可用于推导端到端生成耗时
-      if (pendingDurationCall && pendingDurationHasTools && obj.type === 'GENERIC') {
+      // 紧随 PLANNER_RESPONSE 之后的非用户输入步骤（工具执行 / 系统消息）可用于推导端到端耗时
+      if (pendingDurationCall && obj.type !== 'USER_INPUT') {
         const nextTs = typeof obj.created_at === 'string' ? Date.parse(obj.created_at) : NaN;
-        if (Number.isFinite(nextTs) && pendingDurationCall.rawTs !== null) {
-          const dt = Math.round(nextTs - pendingDurationCall.rawTs);
-          if (dt >= MIN_DURATION_MS && dt <= MAX_DURATION_MS) {
-            pendingDurationCall.durationMs = dt;
-          }
-        }
+        resolvePendingByNextTs(nextTs);
         pendingDurationCall = null;
         pendingDurationHasTools = false;
       } else if (obj.type === 'USER_INPUT') {
@@ -496,14 +518,18 @@ function parseTranscript(appData, convId) {
     }
   }
 
-  // 回填历史上已实时观测到的耗时并计算每步端到端输出速度
+  // 优先回填历史上已实时观测到的毫秒级耗时，其次使用推导值或同秒兜底值，最后计算端到端速度
   for (const c of calls) {
-    if (c.durationMs === null) {
-      const obs = getObservedDuration(selfLower, c.step);
-      if (obs !== null) c.durationMs = obs;
+    const obs = getObservedDuration(selfLower, c.step);
+    if (obs !== null && c.durationMs === null) {
+      c.durationMs = obs;
+    } else if (c.durationMs === null && c.fallbackDurationMs !== null) {
+      c.durationMs = c.fallbackDurationMs;
+      c.durationEstimated = true;
     }
     c.tps = calcStepTps(c.output, c.durationMs);
     delete c.rawTs;
+    delete c.fallbackDurationMs;
   }
 
   // 仅保留磁盘上真实存在 transcript.jsonl 的子会话，避免误关联
@@ -623,7 +649,7 @@ function buildCurrentSnapshot(requestedConvId, pricing) {
       costUsd += cost;
       savedUsd += saved;
 
-      if (isAvgSpeedSample(c.output, c.durationMs, c.tps)) {
+      if (isAvgSpeedSample(c.output, c.durationMs, c.tps, c.durationEstimated)) {
         speedOutput += c.output;
         speedDurationMs += c.durationMs;
         speedSamples += 1;
@@ -836,7 +862,7 @@ function buildOverviewSnapshot(range, pricing, requestedEtag = '') {
       bucket.total += c.input + c.cache + c.output;
       bucket.costUsd += cost;
       bucket.calls += 1;
-      if (isAvgSpeedSample(c.output, c.durationMs, c.tps)) {
+      if (isAvgSpeedSample(c.output, c.durationMs, c.tps, c.durationEstimated)) {
         bucket.speedOutput += c.output;
         bucket.speedDurationMs += c.durationMs;
       }
@@ -944,12 +970,57 @@ function buildPricingResponse() {
 }
 
 // ---------------------------------------------------------------------------
-// Background timing sampler (captures text-only reply durations even when pane is closed)
+// Background timing watcher (fs.watch + 1s fallback captures live mtime at 0ms lag)
 // ---------------------------------------------------------------------------
 
-const WATCH_INTERVAL_MS = 2500;
-const ACTIVE_WINDOW_MS = 60_000;
+const WATCH_INTERVAL_MS = 1000;
+const ACTIVE_WINDOW_MS = 90_000;
+const WATCHER_IDLE_MS = 300_000;
+const MAX_FILE_WATCHERS = 8;
 const lastWatchedStats = new Map(); // filePath -> `${mtime}:${size}`
+const activeFileWatchers = new Map(); // filePath -> { watcher, lastActiveMs }
+
+function ensureFileWatcher(appData, entry, fp, now) {
+  const existing = activeFileWatchers.get(fp);
+  if (existing) {
+    existing.lastActiveMs = now;
+    return;
+  }
+  if (activeFileWatchers.size >= MAX_FILE_WATCHERS) {
+    // 淘汰最久未活跃的 watcher
+    let oldestPath = null;
+    let oldestTs = Infinity;
+    for (const [p, info] of activeFileWatchers) {
+      if (info.lastActiveMs < oldestTs) {
+        oldestTs = info.lastActiveMs;
+        oldestPath = p;
+      }
+    }
+    if (oldestPath) {
+      try { activeFileWatchers.get(oldestPath)?.watcher?.close(); } catch {}
+      activeFileWatchers.delete(oldestPath);
+    }
+  }
+  try {
+    const watcher = watch(fp, { persistent: false }, () => {
+      const st = statOf(fp);
+      if (st.size <= 0) return;
+      const sig = `${st.mtime}:${st.size}`;
+      if (lastWatchedStats.get(fp) === sig) return;
+      lastWatchedStats.set(fp, sig);
+      const info = activeFileWatchers.get(fp);
+      if (info) info.lastActiveMs = Date.now();
+      parseTranscript(appData, entry);
+    });
+    watcher.on('error', () => {
+      try { watcher.close(); } catch {}
+      activeFileWatchers.delete(fp);
+    });
+    activeFileWatchers.set(fp, { watcher, lastActiveMs: now });
+  } catch {
+    // fs.watch 不可用时静默回退到定时采样
+  }
+}
 
 function sampleActiveTranscripts() {
   const now = Date.now();
@@ -961,10 +1032,17 @@ function sampleActiveTranscripts() {
       const fp = transcriptPath(appData, entry);
       const st = statOf(fp);
       if (st.size <= 0 || now - st.mtime > ACTIVE_WINDOW_MS) continue;
+      ensureFileWatcher(appData, entry, fp, now);
       const sig = `${st.mtime}:${st.size}`;
       if (lastWatchedStats.get(fp) === sig) continue;
       lastWatchedStats.set(fp, sig);
       parseTranscript(appData, entry);
+    }
+  }
+  for (const [fp, info] of activeFileWatchers) {
+    if (now - info.lastActiveMs > WATCHER_IDLE_MS) {
+      try { info.watcher.close(); } catch {}
+      activeFileWatchers.delete(fp);
     }
   }
   if (lastWatchedStats.size > MAX_TRANSCRIPT_CACHE) {
