@@ -88,6 +88,10 @@
 
 本项目零第三方依赖，将仓库放置到 Antigravity 的插件发现目录即可直接使用，无需构建或安装 npm 包。
 
+> **注意事项**：
+> - **目录名不可修改**：无论通过 `git clone`、软链接还是下载 ZIP 解压安装，插件文件夹名都**必须保持为 `antigravity-token-monitor`**（不要保留 `-main` 后缀或重命名），否则内置 Skill 的一键唤起链接（`sidecar://antigravity-token-monitor/token_monitor/`）会失效。
+> - **适用客户端**：Sidecar 侧边栏面板适用于 **Antigravity 桌面端 / IDE**；如果你在终端使用 `agy` CLI，可先使用下方[独立运行与本地预览](#独立运行与本地预览)模式在浏览器查看。
+
 ### 方式一：全局安装（推荐）
 
 安装到全局配置目录后，所有工作区和对话中均可使用该插件。
@@ -115,6 +119,8 @@ mkdir -p .agents/plugins
 git clone https://github.com/OriginNull/antigravity-token-monitor.git .agents/plugins/antigravity-token-monitor
 ```
 
+> **提示**：UI Sidecar 面板在全局插件目录（`~/.gemini/config/plugins/`）下发现与常驻最稳定，日常使用建议优先选择**方式一**或**方式三**。
+
 ### 方式三：软链接安装（本地开发推荐）
 
 如果你正在本地修改或二次开发本插件，建议先克隆到常用代码目录，再创建软链接到全局插件目录：
@@ -129,7 +135,7 @@ ln -s /path/to/antigravity-token-monitor ~/.gemini/config/plugins/antigravity-to
 
 1. 放入目录后，Antigravity 会自动发现并默认启用该插件。
 2. 你可以在 Antigravity 左侧 **Skills & Customizations**（插件 / 自定义管理）页面中检查 **Antigravity Token Monitor** 是否已开启。
-3. 若侧边栏未立即出现，重新打开或重启 Antigravity 即可加载 Sidecar 面板。
+3. 首次安装或升级重启 Antigravity 后，Sidecar 后端会自动在后台启动，但右侧辅助栏**通常不会自动弹出面板**，请按下方方式手动拉出一次。
 
 ---
 
@@ -139,11 +145,11 @@ ln -s /path/to/antigravity-token-monitor ~/.gemini/config/plugins/antigravity-to
 
 支持以下两种方式打开面板：
 
-1. **直接从侧边栏打开**：在 Antigravity 右侧辅助侧边栏（Auxiliary Pane）中点击切换到 **Antigravity Token Monitor** 面板。
-2. **在对话中直接唤起**：插件内置了配套 Skill，直接在聊天框输入类似指令，Agent 会返回可一键点击打开侧边栏的直达链接：
+1. **在对话中一键唤起（推荐，首次安装或升级重启后最稳妥）**：插件内置了配套 Skill，直接在聊天框发送以下任意指令，点击 Agent 返回的 **Antigravity Token Monitor** 快捷入口即可立刻拉出右侧栏面板：
    - `打开 Token 监控侧边栏面板`
    - `查看当前对话的上下文占用和缓存命中率`
    - `统计今天和本周各个模型的 Token 消耗与费用`
+2. **直接从侧边栏切换**：当面板已在当前窗口打开过，或右侧辅助栏（Auxiliary Pane）有对应标签页时，直接点击切换到 **Antigravity Token Monitor** 即可。
 
 ### 当前对话视图
 
@@ -294,6 +300,8 @@ cd ~/.gemini/config/plugins/antigravity-token-monitor
 git pull
 ```
 
+> **重要**：由于 Sidecar 后端（`main.mjs`）为常驻进程，拉取更新后请在 Antigravity 的 **Skills & Customizations** 页面将 **Antigravity Token Monitor** **关闭再重新开启**（或重启 Antigravity），以重启后端进程使新版本完全生效。
+
 ### 卸载插件
 
 1. 在 Antigravity 的 **Skills & Customizations** 页面中禁用或卸载 **Antigravity Token Monitor**；
@@ -306,19 +314,26 @@ git pull
 
 ## 常见问题
 
-**1. 面板一直显示“等待对话产生 Token 记录”？**
+**1. 首次安装或更新 Antigravity 后，右侧栏看不到监控面板 / 感觉服务没了？**
+- Antigravity 更新或重启后，虽然 Sidecar 后端已经在后台正常启动，但右侧辅助栏的旧标签页会被重置收起，**不会自动弹出**。
+- 直接在聊天框发送 `打开 Token 监控侧边栏面板`，点击 Agent 返回的快捷链接即可一键重新拉出面板。
+- 如果点击快捷链接无反应，请确认：
+  1. 插件在 **Skills & Customizations** 中处于开启状态；
+  2. 安装目录名严格为 `antigravity-token-monitor`（切勿重命名或保留 ZIP 解压后的 `-main` 后缀）。
+
+**2. 面板一直显示“等待对话产生 Token 记录”？**
 - 请先在当前对话中发送一条消息并等待模型完成回复，面板会自动刷新。
 - 若使用独立模式运行，请确认本机 `~/.gemini/*/brain/` 下存在历史对话日志。
 
-**2. 右上角状态圆点变暗 / 面板无法连接？**
+**3. 右上角状态圆点变暗 / 面板无法连接？**
 - 请确认系统已安装 Node.js 18+ 且 `node` 命令在环境变量 `PATH` 中可正常执行。
 - 若刚安装或更新插件，可尝试在插件管理页关闭后重新开启，或重启 Antigravity。
 
-**3. 为什么上下文占用量比累计 Token 小很多？**
+**4. 为什么上下文占用量比累计 Token 小很多？**
 - **上下文窗口占用** 反映的是 **最近一次调用** 实际送入模型的上下文长度（`缓存读取 + 新输入`），决定了是否接近模型单次窗口上限；
 - **累计 Token** 反映的是整个对话（含多轮交互与子助手）所有调用累加的总消耗量。
 
-**4. 如何判断什么时候该压缩上下文？**
+**5. 如何判断什么时候该压缩上下文？**
 - 当上下文占用进度条达到 **70%** 以上时面板会提示注意精简；达到 **90%** 以上时会高亮提示建议使用 `/compact` 命令整理上下文，以降低延迟并避免超出窗口上限。
 
 ---
