@@ -142,21 +142,60 @@
         <!-- 2 Summary Cards -->
         <section class="kpi-grid">
           <div class="kpi-card">
-            <div class="kpi-label">总消耗 Token</div>
+            <div id="ov-total-label" class="kpi-label">总消耗 Token</div>
             <div id="ov-total" class="kpi-val">0</div>
             <div id="ov-sessions" class="kpi-sub">0 个对话</div>
           </div>
           <div class="kpi-card">
-            <div class="kpi-label">总估算费用</div>
+            <div class="kpi-label-row">
+              <span id="ov-cost-label" class="kpi-label">总估算费用</span>
+              <button type="button" id="btn-clear-day" class="link-btn hidden">返回全局</button>
+            </div>
             <div id="ov-cost" class="kpi-val">$0.00</div>
             <div id="ov-hit-rate" class="kpi-sub ok-text">平均缓存率 0%</div>
+          </div>
+        </section>
+
+        <!-- Annual Daily Activity Heatmap (12 months in 2 rows) -->
+        <section id="ov-heatmap-card" class="card heatmap-card">
+          <div class="hm-head">
+            <div class="hm-title-wrap">
+              <span id="hm-title" class="label">每日活跃</span>
+              <span id="hm-readout" class="hm-readout"></span>
+            </div>
+            <div id="hm-year-ctl" class="hm-year-ctl">
+              <button type="button" id="btn-prev-year" class="hm-nav-btn hidden" aria-label="上一年" title="上一年">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"></polyline></svg>
+              </button>
+              <button type="button" id="btn-year-menu" class="hm-year-btn" aria-haspopup="listbox" aria-expanded="false">
+                <span id="hm-year-label">—</span>
+                <svg id="hm-year-caret" class="hidden" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
+              </button>
+              <button type="button" id="btn-next-year" class="hm-nav-btn hidden" aria-label="下一年" title="下一年">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"></polyline></svg>
+              </button>
+            </div>
+            <div id="hm-year-popover" class="hm-year-popover hidden" role="listbox" aria-label="选择年份"></div>
+          </div>
+          <div id="hm-halves" class="hm-halves"></div>
+          <div class="hm-foot">
+            <span id="hm-summary" class="hm-summary">—</span>
+            <div class="hm-legend" aria-label="活跃度色阶">
+              <span>少</span>
+              <i class="hm-swatch hm-0"></i>
+              <i class="hm-swatch hm-1"></i>
+              <i class="hm-swatch hm-2"></i>
+              <i class="hm-swatch hm-3"></i>
+              <i class="hm-swatch hm-4"></i>
+              <span>多</span>
+            </div>
           </div>
         </section>
 
         <!-- Per-Model Breakdown -->
         <section class="card">
           <div class="row-between mb-sm">
-            <span class="label">分模型消耗</span>
+            <span id="ov-models-title" class="label">分模型消耗</span>
             <span id="ov-saved" class="kpi-sub ok-text">缓存共省 $0.00</span>
           </div>
           <div id="ov-models" class="model-list">
@@ -171,7 +210,7 @@
               <span class="label">实时请求</span>
               <span id="ov-calls-meta" class="calls-meta">0 次</span>
             </div>
-            <span class="calls-meta">跨会话</span>
+            <span id="ov-calls-scope" class="calls-meta">跨会话</span>
           </div>
           <div id="ov-calls-list" class="call-list">
             <div class="empty-inline">该时间段暂无调用记录</div>

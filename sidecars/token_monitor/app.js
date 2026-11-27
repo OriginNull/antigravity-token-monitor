@@ -6,10 +6,14 @@
   const state = {
     tab: 'current', // 'current' | 'overview'
     range: 'today', // 'today' | '7d' | '30d' | 'all'
+    overviewYear: new Date().getFullYear(),
+    overviewDate: null, // 'YYYY-MM-DD' | null
+    yearMenuOpen: false,
     callFilter: 'all', // 'all' | 'main'
     etag: '',
     overviewEtag: '',
     lastOverviewPollAt: 0,
+    lastOverviewData: null,
     lastConv: '',
     lastCurrentData: null,
     seenCallConv: '',
@@ -350,19 +354,247 @@
     renderRecentCalls(data, true);
   }
 
-  // ---------- Render: Global Overview ----------
+  // ---------- Render: Global Overview & Annual Heatmap ----------
+  const pad2 = (n) => String(n).padStart(2, '0');
+
+  function syncRangeButtons() {
+    document.querySelectorAll('.range-btn').forEach((btn) => {
+      const active = !state.overviewDate && btn.dataset.range === state.range;
+      btn.classList.toggle('active', active);
+    });
+  }
+
+  function setHeatmapReadout(dayKey, rec, currency, cnyRate) {
+    const titleEl = $('hm-title');
+    const readEl = $('hm-readout');
+    if (!titleEl || !readEl) return;
+    if (!dayKey) {
+      titleEl.textContent = '每日活跃';
+      readEl.textContent = '';
+      return;
+    }
+    titleEl.textContent = dayKey;
+    readEl.textContent =
+      rec && rec.total > 0
+        ? `${fmtTokens(rec.total)} · ${fmtMoney(rec.costUsd, currency, cnyRate)}`
+        : '无调用';
+  }
+
+  function buildHalfWeeks(year, startMonth, endMonth, todayKey, daysMap) {
+    const halfStart = new Date(year, startMonth, 1);
+    const halfEnd = new Date(year, endMonth + 1, 0);
+    const gridStart = new Date(halfStart);
+    gridStart.setDate(gridStart.getDate() - gridStart.getDay());
+
+    const weeks = [];
+    const monthMarks = [];
+    let lastMonth = -1;
+
+    for (let cur = new Date(gridStart), w = 0; cur <= halfEnd; w += 1) {
+      const col = [];
+      for (let r = 0; r < 7; r += 1) {
+        const d = new Date(cur);
+        const inRange = d >= halfStart && d <= halfEnd;
+        const key = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+        const isFuture = Boolean(todayKey && key > todayKey);
+        if (inRange && d.getMonth() !== lastMonth && d.getDate() <= 7) {
+          monthMarks.push({ weekIdx: w, label: `${d.getMonth() + 1}月` });
+          lastMonth = d.getMonth();
+        }
+        col.push({
+          key,
+          inRange,
+          isFuture,
+          rec: inRange && !isFuture ? daysMap[key] || null : null,
+        });
+        cur.setDate(cur.getDate() + 1);
+      }
+      weeks.push(col);
+    }
+    return { weeks, monthMarks };
+  }
+
+  function renderOverviewHeatmap(data) {
+    const cardEl = $('ov-heatmap-card');
+    const halvesEl = $('hm-halves');
+    if (!cardEl || !halvesEl) return;
+
+    const hm = data?.heatmap;
+    if (!hm || typeof hm !== 'object') {
+      cardEl.classList.add('hidden');
+      return;
+    }
+    cardEl.classList.remove('hidden');
+
+    const { currency, cnyRate } = data;
+    const year = Number(hm.year) || state.overviewYear;
+    const todayKey = hm.today || '';
+    const daysMap = hm.days || {};
+    const years = Array.isArray(hm.years) ? hm.years : [];
+    const multiYear = years.length > 1;
+
+    // 年份选择器：单年静默展示，多年启用 ‹ YYYY ▾ ›（支持 10 年+ 不溢出）
+    $('hm-year-label').textContent = String(year);
+    const prevBtn = $('btn-prev-year');
+    const nextBtn = $('btn-next-year');
+    const yearBtn = $('btn-year-menu');
+    const caretEl = $('hm-year-caret');
+    const popEl = $('hm-year-popover');
+
+    prevBtn.classList.toggle('hidden', !multiYear);
+    nextBtn.classList.toggle('hidden', !multiYear);
+    caretEl.classList.toggle('hidden', !multiYear);
+    yearBtn.classList.toggle('static', !multiYear);
+    yearBtn.setAttribute('aria-expanded', String(multiYear && state.yearMenuOpen));
+
+    if (multiYear) {
+      const yIdx = years.findIndex((y) => y.year === year);
+      prevBtn.disabled = yIdx <= 0;
+      nextBtn.disabled = yIdx < 0 || yIdx >= years.length - 1;
+    } else {
+      state.yearMenuOpen = false;
+    }
+
+    popEl.classList.toggle('hidden', !(multiYear && state.yearMenuOpen));
+    if (multiYear && state.yearMenuOpen) {
+      popEl.innerHTML = [...years]
+        .reverse()
+        .map((y) => {
+          const active = y.year === year;
+          const summaryText =
+            y.total > 0 ? `${fmtTokens(y.total)} · ${fmtMoney(y.costUsd, currency, cnyRate)}` : '无记录';
+          return `
+            <button type="button" class="hm-year-opt${active ? ' active' : ''}" data-pick-year="${y.year}" role="option" aria-selected="${active}">
+              <span>${y.year}</span>
+              <span>${summaryText}</span>
+            </button>
+          `;
+        })
+        .join('');
+      popEl.querySelectorAll('.hm-year-opt').forEach((opt) => {
+        opt.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const picked = Number(opt.dataset.pickYear);
+          state.yearMenuOpen = false;
+          if (picked && picked !== state.overviewYear) {
+            state.overviewYear = picked;
+            state.overviewDate = null;
+            state.overviewEtag = '';
+            syncRangeButtons();
+            pollOverview(true).catch(() => {});
+          } else {
+            renderOverviewHeatmap(data);
+          }
+        });
+      });
+    }
+
+    // 分位数色阶（使不同量级用户都能看到清晰层次）
+    const activeTotals = Object.values(daysMap)
+      .map((d) => Number(d?.total) || 0)
+      .filter((t) => t > 0)
+      .sort((a, b) => a - b);
+    const q = (p) =>
+      activeTotals.length ? activeTotals[Math.min(activeTotals.length - 1, Math.floor(activeTotals.length * p))] : 1;
+    const t1 = q(0.25);
+    const t2 = q(0.55);
+    const t3 = q(0.82);
+
+    const levelOf = (tot) => {
+      if (tot <= 0) return 0;
+      if (tot <= t1) return 1;
+      if (tot <= t2) return 2;
+      if (tot <= t3) return 3;
+      return 4;
+    };
+
+    const h1 = buildHalfWeeks(year, 0, 5, todayKey, daysMap);
+    const h2 = buildHalfWeeks(year, 6, 11, todayKey, daysMap);
+    const cols = Math.max(h1.weeks.length, h2.weeks.length);
+
+    const renderHalf = ({ weeks, monthMarks }) => {
+      const padded = [...weeks];
+      while (padded.length < cols) {
+        padded.push(Array.from({ length: 7 }, () => ({ inRange: false, isFuture: false, rec: null })));
+      }
+      const monthsHtml = monthMarks
+        .map((m) => `<span style="left:${((m.weekIdx / cols) * 100).toFixed(2)}%">${m.label}</span>`)
+        .join('');
+      const colsHtml = padded
+        .map(
+          (col) => `
+            <div class="hm-week-col">
+              ${col
+                .map((cell) => {
+                  if (!cell.inRange) return '<span class="hm-cell empty-pad"></span>';
+                  if (cell.isFuture) return `<span class="hm-cell future-day" title="${esc(cell.key)}"></span>`;
+                  const tot = Number(cell.rec?.total) || 0;
+                  const lv = levelOf(tot);
+                  const isSel = state.overviewDate === cell.key;
+                  const isDim = Boolean(state.overviewDate && !isSel);
+                  return `<button type="button" data-day="${cell.key}" class="hm-cell hm-${lv}${isSel ? ' selected' : ''}${isDim ? ' dimmed' : ''}" aria-label="${esc(cell.key)}"></button>`;
+                })
+                .join('')}
+            </div>
+          `,
+        )
+        .join('');
+      return `
+        <div>
+          <div class="hm-half-months">${monthsHtml}</div>
+          <div class="hm-half-grid" style="grid-template-columns:repeat(${cols}, minmax(0, 1fr))">${colsHtml}</div>
+        </div>
+      `;
+    };
+
+    halvesEl.innerHTML = renderHalf(h1) + renderHalf(h2);
+
+    halvesEl.querySelectorAll('.hm-cell[data-day]').forEach((btn) => {
+      const dayKey = btn.dataset.day;
+      const rec = daysMap[dayKey] || null;
+      btn.addEventListener('mouseenter', () => setHeatmapReadout(dayKey, rec, currency, cnyRate));
+      btn.addEventListener('mouseleave', () => {
+        const curKey = state.overviewDate;
+        setHeatmapReadout(curKey, curKey ? daysMap[curKey] || null : null, currency, cnyRate);
+      });
+      btn.addEventListener('click', () => {
+        state.overviewDate = state.overviewDate === dayKey ? null : dayKey;
+        state.yearMenuOpen = false;
+        state.overviewEtag = '';
+        syncRangeButtons();
+        pollOverview(true).catch(() => {});
+      });
+    });
+
+    $('hm-summary').textContent = `${year} 年活跃 ${hm.activeDays || 0} 天`;
+    const activeKey = state.overviewDate;
+    setHeatmapReadout(activeKey, activeKey ? daysMap[activeKey] || null : null, currency, cnyRate);
+  }
+
   function renderOverview(data) {
     if (!data) return;
+    state.lastOverviewData = data;
     const { totals, models, currency, cnyRate } = data;
+    const activeDate = data.date || null;
+
+    syncRangeButtons();
+    $('ov-total-label').textContent = activeDate ? `${activeDate} 消耗` : '总消耗 Token';
+    $('ov-cost-label').textContent = activeDate ? '当日估算费用' : '总估算费用';
+    $('btn-clear-day').classList.toggle('hidden', !activeDate);
+    $('ov-models-title').textContent = activeDate ? `${activeDate} · 分模型消耗` : '分模型消耗';
+    $('ov-calls-scope').textContent = activeDate || '跨会话';
+
     $('ov-total').textContent = fmtTokens(totals.totalTokens);
     $('ov-sessions').textContent = `${totals.sessionCount} 个对话 · ${totals.callCount} 次调用`;
     $('ov-cost').textContent = fmtMoney(totals.costUsd, currency, cnyRate);
     $('ov-hit-rate').textContent = `平均缓存率 ${totals.avgCacheHitRate.toFixed(1)}%`;
     $('ov-saved').textContent = `缓存共省 ${fmtMoney(totals.savedUsd, currency, cnyRate)}`;
 
+    renderOverviewHeatmap(data);
+
     const container = $('ov-models');
     if (!models || !models.length) {
-      container.innerHTML = '<div class="empty-inline">该时间段暂无调用记录</div>';
+      container.innerHTML = `<div class="empty-inline">${activeDate ? '该日期暂无调用记录' : '该时间段暂无调用记录'}</div>`;
     } else {
       container.innerHTML = models
         .map((m, idx) => {
@@ -408,7 +640,7 @@
     metaEl.textContent =
       calls.length < totalExpected ? `最近 ${calls.length} / ${totalExpected} 次` : `${totalExpected} 次`;
 
-    const rangeKey = data.range || state.range;
+    const rangeKey = `${data.range || state.range}|${data.date || ''}`;
     const sameRange = rangeKey === state.seenOverviewRange;
     const newlyArrived = new Set();
     if (sameRange) {
@@ -502,15 +734,25 @@
     if (!force && (state.pollingOverview || now - state.lastOverviewPollAt < OVERVIEW_POLL_MS)) return;
 
     const targetRange = state.range;
+    const targetYear = state.overviewYear;
+    const targetDate = state.overviewDate;
     const reqSeq = ++state.overviewReqSeq;
     state.pollingOverview = true;
     state.lastOverviewPollAt = now;
     try {
-      const qs = new URLSearchParams({ range: targetRange });
+      const qs = new URLSearchParams({ range: targetRange, year: String(targetYear) });
+      if (targetDate) qs.set('date', targetDate);
       if (!force && state.overviewEtag) qs.set('etag', state.overviewEtag);
 
       const data = await apiFetch(`/api/overview?${qs.toString()}`);
-      if (reqSeq !== state.overviewReqSeq || targetRange !== state.range) return;
+      if (
+        reqSeq !== state.overviewReqSeq ||
+        targetRange !== state.range ||
+        targetYear !== state.overviewYear ||
+        targetDate !== state.overviewDate
+      ) {
+        return;
+      }
       $('live-dot').classList.remove('stale');
       if (data.unchanged) return;
       state.overviewEtag = data.etag || '';
@@ -564,10 +806,63 @@
   document.querySelectorAll('.range-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       state.range = btn.dataset.range || 'today';
+      state.overviewDate = null;
+      state.yearMenuOpen = false;
       state.overviewEtag = '';
-      document.querySelectorAll('.range-btn').forEach((b) => b.classList.toggle('active', b === btn));
+      syncRangeButtons();
       pollOverview(true).catch(() => {});
     });
+  });
+
+  $('btn-clear-day')?.addEventListener('click', () => {
+    if (!state.overviewDate) return;
+    state.overviewDate = null;
+    state.overviewEtag = '';
+    syncRangeButtons();
+    pollOverview(true).catch(() => {});
+  });
+
+  $('btn-prev-year')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const years = state.lastOverviewData?.heatmap?.years || [];
+    const idx = years.findIndex((y) => y.year === state.overviewYear);
+    if (idx > 0) {
+      state.overviewYear = years[idx - 1].year;
+      state.overviewDate = null;
+      state.yearMenuOpen = false;
+      state.overviewEtag = '';
+      syncRangeButtons();
+      pollOverview(true).catch(() => {});
+    }
+  });
+
+  $('btn-next-year')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const years = state.lastOverviewData?.heatmap?.years || [];
+    const idx = years.findIndex((y) => y.year === state.overviewYear);
+    if (idx >= 0 && idx < years.length - 1) {
+      state.overviewYear = years[idx + 1].year;
+      state.overviewDate = null;
+      state.yearMenuOpen = false;
+      state.overviewEtag = '';
+      syncRangeButtons();
+      pollOverview(true).catch(() => {});
+    }
+  });
+
+  $('btn-year-menu')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const years = state.lastOverviewData?.heatmap?.years || [];
+    if (years.length <= 1) return;
+    state.yearMenuOpen = !state.yearMenuOpen;
+    if (state.lastOverviewData) renderOverviewHeatmap(state.lastOverviewData);
+  });
+
+  document.addEventListener('click', () => {
+    if (state.yearMenuOpen) {
+      state.yearMenuOpen = false;
+      if (state.lastOverviewData) renderOverviewHeatmap(state.lastOverviewData);
+    }
   });
 
   // ---------- Settings Drawer ----------
@@ -661,7 +956,12 @@
     if (e.target === $('settings-backdrop')) closeSettings();
   });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !$('settings-backdrop').classList.contains('hidden')) {
+    if (e.key !== 'Escape') return;
+    if (state.yearMenuOpen) {
+      state.yearMenuOpen = false;
+      if (state.lastOverviewData) renderOverviewHeatmap(state.lastOverviewData);
+    }
+    if (!$('settings-backdrop').classList.contains('hidden')) {
       closeSettings();
     }
   });

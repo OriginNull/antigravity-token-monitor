@@ -20,7 +20,7 @@ const UUID_GLOBAL_RE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-
 const DELEGATION_TOOLS = new Set(['invoke_subagent', 'send_message', 'manage_subagents', 'swarm', 'run_workflow']);
 const DELEGATION_RESPONSE_HINT_RE = /conversationId|conversation_id|conversation:\/\/|subagent|swarm|worker|workflow/i;
 const MAX_TRANSCRIPT_CACHE = 1000;
-const MAX_OVERVIEW_CACHE = 8;
+const MAX_OVERVIEW_CACHE = 16;
 const MAX_RECENT_CALLS = 100;
 const MAX_TIMING_ENTRIES = 4000;
 const MIN_DURATION_MS = 150;
@@ -824,9 +824,54 @@ function rangeStartMs(range) {
   return 0;
 }
 
-function buildOverviewSnapshot(range, pricing, requestedEtag = '') {
+const DATE_KEY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+function formatLocalDateKey(ts) {
+  const d = new Date(ts);
+  if (!Number.isFinite(d.getTime())) return '';
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function parseLocalDateRange(dateKey) {
+  if (typeof dateKey !== 'string') return null;
+  const m = DATE_KEY_RE.exec(dateKey.trim());
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mon = Number(m[2]);
+  const day = Number(m[3]);
+  const start = new Date(y, mon - 1, day);
+  if (start.getFullYear() !== y || start.getMonth() !== mon - 1 || start.getDate() !== day) {
+    return null;
+  }
+  const end = new Date(y, mon - 1, day + 1);
+  return {
+    key: `${m[1]}-${m[2]}-${m[3]}`,
+    year: y,
+    startMs: start.getTime(),
+    endMs: end.getTime(),
+  };
+}
+
+function buildOverviewSnapshot(range, pricing, requestedEtag = '', options = {}) {
   const validRange = ['today', '7d', '30d', 'all'].includes(range) ? range : 'today';
-  const minTs = rangeStartMs(validRange);
+  const now = new Date();
+  const currentYear = now.getFullYear();
+  const todayKey = formatLocalDateKey(now.getTime());
+
+  const dateFilter = parseLocalDateRange(options?.date);
+  const rawYear = Number(options?.year);
+  const targetYear =
+    Number.isInteger(rawYear) && rawYear >= 2000 && rawYear <= 2100
+      ? rawYear
+      : dateFilter
+        ? dateFilter.year
+        : currentYear;
+
+  const minTs = dateFilter ? dateFilter.startMs : rangeStartMs(validRange);
+  const maxTs = dateFilter ? dateFilter.endMs : Infinity;
   const dirs = findAppDataDirs();
 
   // 先扫描文件元数据生成轻量指纹，未变化时直接命中 ETag 或内存缓存
@@ -849,12 +894,13 @@ function buildOverviewSnapshot(range, pricing, requestedEtag = '') {
   statParts.sort();
 
   const pHash = pricingHash(pricing);
-  const etag = shortHash(`${validRange}|${minTs}|${pHash}|${statParts.join(',')}`);
+  const cacheKey = `${validRange}|${dateFilter ? dateFilter.key : ''}|${targetYear}`;
+  const etag = shortHash(`${cacheKey}|${todayKey}|${minTs}|${pHash}|${statParts.join(',')}`);
   if (requestedEtag && requestedEtag === etag) {
     return { unchanged: true, etag };
   }
 
-  const cachedOverview = overviewCache.get(validRange);
+  const cachedOverview = overviewCache.get(cacheKey);
   if (cachedOverview && cachedOverview.etag === etag) {
     return cachedOverview.snapshot;
   }
@@ -869,6 +915,8 @@ function buildOverviewSnapshot(range, pricing, requestedEtag = '') {
 
   const byModel = new Map(); // modelId -> { model, display, input, cache, output, total, costUsd, calls }
   const discoveredModels = new Set();
+  const byYear = new Map(); // year -> { year, total, costUsd, calls, activeDays: Set<string> }
+  const yearDays = new Map(); // YYYY-MM-DD -> { total, input, cache, output, costUsd, calls }
   let recentPool = [];
   let recentCutoffTs = -Infinity;
   let seq = 0;
@@ -888,11 +936,42 @@ function buildOverviewSnapshot(range, pricing, requestedEtag = '') {
       prevCtx = ctxNow;
 
       discoveredModels.add(c.model);
-      if (minTs > 0 && c.ts < minTs) continue;
-      convMatched = true;
-
       const rule = ruleForModel(c.model, pricing);
       const { cost, saved } = calcCostUsd(c.input, c.cache, c.output, rule);
+      const callTotal = c.input + c.cache + c.output;
+
+      // 一次遍历同步聚合全年每日热力图与各年汇总（不受 range/date 筛选限制）
+      const dayKey = formatLocalDateKey(c.ts);
+      if (dayKey) {
+        const y = Number(dayKey.slice(0, 4));
+        let yb = byYear.get(y);
+        if (!yb) {
+          yb = { year: y, total: 0, costUsd: 0, calls: 0, activeDays: new Set() };
+          byYear.set(y, yb);
+        }
+        yb.total += callTotal;
+        yb.costUsd += cost;
+        yb.calls += 1;
+        if (callTotal > 0) yb.activeDays.add(dayKey);
+
+        if (y === targetYear) {
+          let db = yearDays.get(dayKey);
+          if (!db) {
+            db = { total: 0, input: 0, cache: 0, output: 0, costUsd: 0, calls: 0 };
+            yearDays.set(dayKey, db);
+          }
+          db.total += callTotal;
+          db.input += c.input;
+          db.cache += c.cache;
+          db.output += c.output;
+          db.costUsd += cost;
+          db.calls += 1;
+        }
+      }
+
+      if (minTs > 0 && c.ts < minTs) continue;
+      if (c.ts >= maxTs) continue;
+      convMatched = true;
 
       totalInput += c.input;
       totalCache += c.cache;
@@ -920,7 +999,7 @@ function buildOverviewSnapshot(range, pricing, requestedEtag = '') {
       bucket.input += c.input;
       bucket.cache += c.cache;
       bucket.output += c.output;
-      bucket.total += c.input + c.cache + c.output;
+      bucket.total += callTotal;
       bucket.costUsd += cost;
       bucket.calls += 1;
       if (isAvgSpeedSample(c.output, c.durationMs, c.tps, c.durationEstimated)) {
@@ -941,7 +1020,7 @@ function buildOverviewSnapshot(range, pricing, requestedEtag = '') {
           input: c.input,
           cache: c.cache,
           output: c.output,
-          total: c.input + c.cache + c.output,
+          total: callTotal,
           cacheHitRate: ctxNow > 0 ? (c.cache / ctxNow) * 100 : 0,
           costUsd: cost,
           contextDelta,
@@ -975,8 +1054,33 @@ function buildOverviewSnapshot(range, pricing, requestedEtag = '') {
       avgTps: mDur > 0 ? mOut / (mDur / 1000) : null,
     }));
 
+  // 保证年份列表至少包含当前年与目标年，按年份升序排列
+  if (!byYear.has(currentYear)) {
+    byYear.set(currentYear, { year: currentYear, total: 0, costUsd: 0, calls: 0, activeDays: new Set() });
+  }
+  if (!byYear.has(targetYear)) {
+    byYear.set(targetYear, { year: targetYear, total: 0, costUsd: 0, calls: 0, activeDays: new Set() });
+  }
+  const years = [...byYear.values()]
+    .sort((a, b) => a.year - b.year)
+    .map((y) => ({
+      year: y.year,
+      total: y.total,
+      costUsd: y.costUsd,
+      calls: y.calls,
+      activeDays: y.activeDays.size,
+    }));
+
+  const daysObj = {};
+  let activeDays = 0;
+  for (const [k, v] of yearDays.entries()) {
+    daysObj[k] = v;
+    if (v.total > 0) activeDays += 1;
+  }
+
   const snapshot = {
     range: validRange,
+    date: dateFilter ? dateFilter.key : null,
     etag,
     totals: {
       totalTokens,
@@ -991,15 +1095,22 @@ function buildOverviewSnapshot(range, pricing, requestedEtag = '') {
     },
     models,
     recentCalls,
+    heatmap: {
+      year: targetYear,
+      today: todayKey,
+      activeDays,
+      years,
+      days: daysObj,
+    },
     discoveredModels: [...discoveredModels].sort(),
     currency: pricing.currency,
     cnyRate: pricing.cnyRate,
   };
 
-  if (overviewCache.has(validRange)) {
-    overviewCache.delete(validRange);
+  if (overviewCache.has(cacheKey)) {
+    overviewCache.delete(cacheKey);
   }
-  overviewCache.set(validRange, { etag, snapshot });
+  overviewCache.set(cacheKey, { etag, snapshot });
   while (overviewCache.size > MAX_OVERVIEW_CACHE) {
     const oldestKey = overviewCache.keys().next().value;
     overviewCache.delete(oldestKey);
@@ -1163,7 +1274,10 @@ async function start() {
       '/api/overview',
       (data) => {
         const pricing = loadPricing();
-        return buildOverviewSnapshot(data?.range || 'today', pricing, data?.etag || '');
+        return buildOverviewSnapshot(data?.range || 'today', pricing, data?.etag || '', {
+          year: data?.year,
+          date: data?.date,
+        });
       },
       'GET',
     );
@@ -1221,7 +1335,9 @@ async function start() {
       const pricing = loadPricing();
       const range = url.searchParams.get('range') || 'today';
       const etag = url.searchParams.get('etag') || '';
-      return send(200, buildOverviewSnapshot(range, pricing, etag));
+      const year = url.searchParams.get('year') || '';
+      const date = url.searchParams.get('date') || '';
+      return send(200, buildOverviewSnapshot(range, pricing, etag, { year, date }));
     }
     if (req.method === 'GET' && url.pathname === '/api/pricing') {
       return send(200, buildPricingResponse());
