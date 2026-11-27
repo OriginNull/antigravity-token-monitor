@@ -151,8 +151,8 @@ function recordObservedDuration(convId, step, durationMs) {
   if (!Number.isFinite(ms) || ms < MIN_DURATION_MS || ms > MAX_DURATION_MS) return;
   ensureTimingsLoaded();
   const key = `${convId}:${step}`;
-  if (observedDurations.get(key) === ms) return;
-  if (observedDurations.has(key)) observedDurations.delete(key);
+  // 保留首次落盘时捕获的精准耗时，避免后续文件 mtime 漂移覆盖
+  if (observedDurations.has(key)) return;
   observedDurations.set(key, ms);
   while (observedDurations.size > MAX_TIMING_ENTRIES) {
     const oldest = observedDurations.keys().next().value;
@@ -473,13 +473,14 @@ function parseTranscript(appData, convId) {
       }
     } else {
       lastRecordCall = null;
-      // 紧随 PLANNER_RESPONSE 之后的非用户输入步骤（工具执行 / 系统消息）可用于推导端到端耗时
-      if (pendingDurationCall && obj.type !== 'USER_INPUT') {
+      // 仅带工具调用的 PLANNER_RESPONSE 紧随其后的首条 GENERIC 可用于推导端到端生成耗时；
+      // SYSTEM_MESSAGE（如后台打包/子任务完成通知、定时唤醒）与 USER_INPUT 之间可能隔着长任务等待，严禁用于推导
+      if (pendingDurationCall && pendingDurationHasTools && obj.type === 'GENERIC') {
         const nextTs = typeof obj.created_at === 'string' ? Date.parse(obj.created_at) : NaN;
         resolvePendingByNextTs(nextTs);
         pendingDurationCall = null;
         pendingDurationHasTools = false;
-      } else if (obj.type === 'USER_INPUT') {
+      } else if (obj.type === 'USER_INPUT' || obj.type === 'SYSTEM_MESSAGE') {
         pendingDurationCall = null;
         pendingDurationHasTools = false;
       }
@@ -511,10 +512,15 @@ function parseTranscript(appData, convId) {
 
   // 若文件最后一条有效记录就是 PLANNER_RESPONSE，文件 mtime 即该回复写完落盘的毫秒时间
   if (lastRecordCall && lastRecordCall.durationMs === null && lastRecordCall.rawTs !== null) {
-    const dt = Math.round(st.mtime - lastRecordCall.rawTs);
-    if (dt >= MIN_DURATION_MS && dt <= MAX_DURATION_MS) {
-      lastRecordCall.durationMs = dt;
-      recordObservedDuration(selfLower, lastRecordCall.step, dt);
+    const existingObs = getObservedDuration(selfLower, lastRecordCall.step);
+    if (existingObs !== null) {
+      lastRecordCall.durationMs = existingObs;
+    } else {
+      const dt = Math.round(st.mtime - lastRecordCall.rawTs);
+      if (dt >= MIN_DURATION_MS && dt <= MAX_DURATION_MS) {
+        lastRecordCall.durationMs = dt;
+        recordObservedDuration(selfLower, lastRecordCall.step, dt);
+      }
     }
   }
 
