@@ -64,6 +64,31 @@
   // ---------- Sidecar API helpers ----------
   const urlParams = new URLSearchParams(location.search);
   const currentConvId = () => window.sidecar?.conversationId || urlParams.get('conversationId') || '';
+  const PAGE_ASSET_VER = typeof window.__TM_ASSET_VER__ === 'string' ? window.__TM_ASSET_VER__ : '';
+  let pendingAssetReload = false;
+
+  function triggerAssetReload() {
+    try {
+      const now = Date.now();
+      const last = Number(sessionStorage.getItem('tm_last_auto_reload') || '0');
+      if (now - last < 3000) return false;
+      sessionStorage.setItem('tm_last_auto_reload', String(now));
+    } catch {
+      // ignore storage errors in restricted webviews
+    }
+    location.reload();
+    return true;
+  }
+
+  function maybeAutoReload(data) {
+    if (!PAGE_ASSET_VER || !data?.assetVer || data.assetVer === PAGE_ASSET_VER) return false;
+    const settingsOpen = $('settings-backdrop') && !$('settings-backdrop').classList.contains('hidden');
+    if (settingsOpen) {
+      pendingAssetReload = true;
+      return false;
+    }
+    return triggerAssetReload();
+  }
 
   async function apiFetch(path, options = {}) {
     const f = window.sidecar?.fetch ? window.sidecar.fetch.bind(window.sidecar) : fetch;
@@ -721,6 +746,7 @@
       const data = await apiFetch(`/api/current?${qs.toString()}`);
       if (reqSeq !== state.currentReqSeq || conv !== currentConvId()) return;
       $('live-dot').classList.remove('stale');
+      if (maybeAutoReload(data)) return;
       if (data.unchanged) return;
       state.etag = data.etag || '';
       renderCurrent(data);
@@ -754,6 +780,7 @@
         return;
       }
       $('live-dot').classList.remove('stale');
+      if (maybeAutoReload(data)) return;
       if (data.unchanged) return;
       state.overviewEtag = data.etag || '';
       renderOverview(data);
@@ -931,6 +958,10 @@
 
   function closeSettings() {
     $('settings-backdrop').classList.add('hidden');
+    if (pendingAssetReload) {
+      pendingAssetReload = false;
+      triggerAssetReload();
+    }
   }
 
   function showToast(msg, isError = false) {

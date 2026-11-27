@@ -7,6 +7,7 @@
  * Persists user-customized model pricing & currency settings in:
  *   <ANTIGRAVITY_EXECUTABLE_DATA_DIR>/pricing.json (or alongside main.mjs standalone)
  */
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, watch, writeFileSync } from 'node:fs';
 import http from 'node:http';
@@ -14,7 +15,9 @@ import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+const __selfFile = fileURLToPath(import.meta.url);
+const __dirname = dirname(__selfFile);
+const BOOT_ID = `${process.pid}-${Date.now().toString(36)}`;
 const ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const UUID_GLOBAL_RE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
 const DELEGATION_TOOLS = new Set(['invoke_subagent', 'send_message', 'manage_subagents', 'swarm', 'run_workflow']);
@@ -1233,6 +1236,88 @@ function startTimingWatcher() {
   if (typeof timer.unref === 'function') timer.unref();
 }
 
+const ASSET_FILES = ['index.html', 'styles.css', 'app.js'];
+
+function getAssetVersion() {
+  const parts = [BOOT_ID];
+  for (const file of ASSET_FILES) {
+    const st = statOf(join(__dirname, file));
+    parts.push(`${file}:${Math.trunc(st.mtime)}:${st.size}`);
+  }
+  return shortHash(parts.join('|'));
+}
+
+function renderIndexHtml() {
+  const ver = getAssetVersion();
+  const cssVer = Math.trunc(statOf(join(__dirname, 'styles.css')).mtime) || ver;
+  const jsVer = Math.trunc(statOf(join(__dirname, 'app.js')).mtime) || ver;
+  let html = readFileSync(join(__dirname, 'index.html'), 'utf-8');
+  html = html.replace('href="/styles.css"', `href="/styles.css?v=${cssVer}"`);
+  html = html.replace('src="/app.js"', `src="/app.js?v=${jsVer}"`);
+  const verScript = `<script>window.__TM_ASSET_VER__=${JSON.stringify(ver)};</script>`;
+  if (html.includes('<script src="/preload.js"></script>')) {
+    html = html.replace('<script src="/preload.js"></script>', `<script src="/preload.js"></script>\n  ${verScript}`);
+  } else if (html.includes('</head>')) {
+    html = html.replace('</head>', `  ${verScript}\n</head>`);
+  }
+  return html;
+}
+
+function attachAssetVer(payload) {
+  if (payload && typeof payload === 'object') {
+    return { ...payload, assetVer: getAssetVersion() };
+  }
+  return payload;
+}
+
+function startSelfReloadWatcher() {
+  const initialSt = statOf(__selfFile);
+  if (initialSt.size <= 0) return;
+  const initialSig = `${initialSt.mtime}:${initialSt.size}`;
+  let pendingTimer = null;
+  let restarting = false;
+
+  const scheduleCheck = () => {
+    if (restarting) return;
+    const st = statOf(__selfFile);
+    if (st.size <= 0) return;
+    const sig = `${st.mtime}:${st.size}`;
+    if (sig === initialSig) return;
+    if (pendingTimer) clearTimeout(pendingTimer);
+    pendingTimer = setTimeout(() => {
+      pendingTimer = null;
+      if (restarting) return;
+      const latest = statOf(__selfFile);
+      if (latest.size <= 0 || `${latest.mtime}:${latest.size}` === initialSig) return;
+      try {
+        // 仅在语法完全合法时触发自重启，避免编辑中途语法错导致重启循环
+        execFileSync(process.execPath, ['--check', __selfFile], { stdio: 'ignore', timeout: 5000 });
+      } catch {
+        return;
+      }
+      restarting = true;
+      console.log('[antigravity-token-monitor] main.mjs updated on disk, exiting for auto-restart...');
+      process.exit(0);
+    }, 600);
+    if (typeof pendingTimer.unref === 'function') pendingTimer.unref();
+  };
+
+  try {
+    // 监听目录以兼容 git pull / 原子 rename 替换文件 inode
+    const watcher = watch(__dirname, { persistent: false }, (_evt, filename) => {
+      if (!filename || filename === basename(__selfFile)) scheduleCheck();
+    });
+    watcher.on('error', () => {
+      try { watcher.close(); } catch {}
+    });
+  } catch {
+    // 忽略不支持 fs.watch 的环境，依赖下方定时兜底
+  }
+
+  const timer = setInterval(scheduleCheck, 2000);
+  if (typeof timer.unref === 'function') timer.unref();
+}
+
 // ---------------------------------------------------------------------------
 // Server bootstrap (SidecarApp in Antigravity, HTTP fallback standalone)
 // ---------------------------------------------------------------------------
@@ -1247,10 +1332,11 @@ async function start() {
   }
 
   if (sdk?.SidecarApp) {
+    startSelfReloadWatcher();
     const { SidecarApp, Response } = sdk;
     const app = new SidecarApp();
 
-    app.page('/', () => readFileSync(join(__dirname, 'index.html'), 'utf-8'));
+    app.page('/', () => renderIndexHtml());
 
     for (const [route, [file, contentType]] of Object.entries(STATIC_FILES)) {
       app.api(route, () => new Response(readFileSync(join(__dirname, file), 'utf-8'), { contentType }), 'GET');
@@ -1263,9 +1349,9 @@ async function start() {
         const conv = data?.conversationId || app.config?.conversationId || '';
         const snap = buildCurrentSnapshot(conv, pricing);
         if (data?.etag && data.etag === snap.etag) {
-          return { unchanged: true, etag: snap.etag };
+          return attachAssetVer({ unchanged: true, etag: snap.etag });
         }
-        return snap;
+        return attachAssetVer(snap);
       },
       'GET',
     );
@@ -1274,10 +1360,12 @@ async function start() {
       '/api/overview',
       (data) => {
         const pricing = loadPricing();
-        return buildOverviewSnapshot(data?.range || 'today', pricing, data?.etag || '', {
-          year: data?.year,
-          date: data?.date,
-        });
+        return attachAssetVer(
+          buildOverviewSnapshot(data?.range || 'today', pricing, data?.etag || '', {
+            year: data?.year,
+            date: data?.date,
+          }),
+        );
       },
       'GET',
     );
@@ -1313,7 +1401,7 @@ async function start() {
     };
 
     if (req.method === 'GET' && url.pathname === '/') {
-      return send(200, readFileSync(join(__dirname, 'index.html'), 'utf-8'), 'text/html; charset=utf-8');
+      return send(200, renderIndexHtml(), 'text/html; charset=utf-8');
     }
     if (req.method === 'GET' && url.pathname === '/preload.js') {
       return send(200, '/* standalone stub */\n', 'application/javascript; charset=utf-8');
@@ -1327,9 +1415,9 @@ async function start() {
       const conv = url.searchParams.get('conversationId') || '';
       const snap = buildCurrentSnapshot(conv, pricing);
       if (url.searchParams.get('etag') && url.searchParams.get('etag') === snap.etag) {
-        return send(200, { unchanged: true, etag: snap.etag });
+        return send(200, attachAssetVer({ unchanged: true, etag: snap.etag }));
       }
-      return send(200, snap);
+      return send(200, attachAssetVer(snap));
     }
     if (req.method === 'GET' && url.pathname === '/api/overview') {
       const pricing = loadPricing();
@@ -1337,7 +1425,7 @@ async function start() {
       const etag = url.searchParams.get('etag') || '';
       const year = url.searchParams.get('year') || '';
       const date = url.searchParams.get('date') || '';
-      return send(200, buildOverviewSnapshot(range, pricing, etag, { year, date }));
+      return send(200, attachAssetVer(buildOverviewSnapshot(range, pricing, etag, { year, date })));
     }
     if (req.method === 'GET' && url.pathname === '/api/pricing') {
       return send(200, buildPricingResponse());
