@@ -18,6 +18,11 @@
     seenOverviewCallIds: new Set(),
     pricingDraft: null,
     currencyDraft: 'USD',
+    currentReqSeq: 0,
+    overviewReqSeq: 0,
+    pollingCurrent: false,
+    pollingOverview: false,
+    toastTimer: null,
   };
 
   const MODEL_COLORS = [
@@ -138,9 +143,10 @@
   function fmtDuration(ms) {
     if (ms === null || ms === undefined || !Number.isFinite(Number(ms))) return '—';
     const sec = Number(ms) / 1000;
-    if (sec < 60) return `${sec.toFixed(1)}s`;
-    const m = Math.floor(sec / 60);
-    const s = Math.round(sec % 60);
+    if (sec < 59.95) return `${sec.toFixed(1)}s`;
+    const totalSec = Math.round(sec);
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
     return `${m}m ${s}s`;
   }
 
@@ -152,8 +158,10 @@
     return '';
   }
 
-  function fmtSpeedTitle(durationMs) {
-    const dur = durationMs ? `耗时 ${fmtDuration(durationMs)} · ` : '';
+  function fmtSpeedTitle(durationMs, estimated = false) {
+    const dur = durationMs
+      ? `耗时${estimated ? '约 ' : ' '}${fmtDuration(durationMs)}${estimated ? '（同秒估算）' : ''} · `
+      : '';
     return `${dur}端到端输出速度（含思考与首字等待）`;
   }
 
@@ -198,14 +206,8 @@
         }
       }
     }
-    if (convId !== state.seenCallConv) {
-      state.seenCallConv = convId;
-      state.seenCallIds = new Set(allCalls.map((c) => c.id).filter(Boolean));
-    } else {
-      for (const c of allCalls) {
-        if (c.id) state.seenCallIds.add(c.id);
-      }
-    }
+    state.seenCallConv = convId;
+    state.seenCallIds = new Set(allCalls.map((c) => c.id).filter(Boolean));
 
     const filtered = state.callFilter === 'main' ? allCalls.filter((c) => !c.isSubagent) : allCalls;
     const totalExpected =
@@ -217,7 +219,11 @@
       filtered.length < totalExpected ? `最近 ${filtered.length} / ${totalExpected} 次` : `${totalExpected} 次`;
 
     if (!filtered.length) {
-      listEl.innerHTML = '<div class="empty-inline">暂无请求记录</div>';
+      const emptyMsg =
+        state.callFilter === 'main' && totalExpected > 0
+          ? `最近 ${allCalls.length} 条均为子助手调用`
+          : '暂无请求记录';
+      listEl.innerHTML = `<div class="empty-inline">${emptyMsg}</div>`;
       return;
     }
 
@@ -240,7 +246,7 @@
               <div class="call-left">
                 <span class="call-time">${fmtTime(c.ts)}</span>
                 ${c.isSubagent ? '<span class="call-badge">子</span>' : ''}
-                ${tpsText ? `<span class="${tpsClass}" title="${esc(fmtSpeedTitle(c.durationMs))}">${tpsText}</span>` : ''}
+                ${tpsText ? `<span class="${tpsClass}" title="${esc(fmtSpeedTitle(c.durationMs, c.durationEstimated))}">${tpsText}</span>` : ''}
                 ${showModel ? `<span class="call-model">${esc(c.modelDisplay || c.model)}</span>` : ''}
               </div>
               <div class="call-right">
@@ -316,7 +322,8 @@
     }
     const lastDurEl = $('cur-last-dur');
     if (lastDurEl) {
-      lastDurEl.textContent = fmtDuration(sp.lastDurationMs);
+      const durText = fmtDuration(sp.lastDurationMs);
+      lastDurEl.textContent = sp.lastEstimated && durText !== '—' ? `~${durText}` : durText;
     }
 
     $('cur-total').textContent = fmtTokens(totals.totalTokens);
@@ -410,13 +417,9 @@
           newlyArrived.add(c.id);
         }
       }
-      for (const c of calls) {
-        if (c.id) state.seenOverviewCallIds.add(c.id);
-      }
-    } else {
-      state.seenOverviewRange = rangeKey;
-      state.seenOverviewCallIds = new Set(calls.map((c) => c.id).filter(Boolean));
     }
+    state.seenOverviewRange = rangeKey;
+    state.seenOverviewCallIds = new Set(calls.map((c) => c.id).filter(Boolean));
 
     if (!calls.length) {
       listEl.innerHTML = '<div class="empty-inline">该时间段暂无调用记录</div>';
@@ -443,7 +446,7 @@
               <div class="call-left">
                 <span class="call-time">${fmtTime(c.ts, true)}</span>
                 ${isCur ? '<span class="call-badge cur">当前</span>' : ''}
-                ${tpsText ? `<span class="${tpsClass}" title="${esc(fmtSpeedTitle(c.durationMs))}">${tpsText}</span>` : ''}
+                ${tpsText ? `<span class="${tpsClass}" title="${esc(fmtSpeedTitle(c.durationMs, c.durationEstimated))}">${tpsText}</span>` : ''}
                 <span class="call-model">${esc(c.modelDisplay || c.model)}</span>
               </div>
               <div class="call-right">
@@ -474,30 +477,47 @@
       state.callFilter = 'all';
       force = true;
     }
-    const qs = new URLSearchParams();
-    if (conv) qs.set('conversationId', conv);
-    if (!force && state.etag) qs.set('etag', state.etag);
+    if (!force && state.pollingCurrent) return;
 
-    const data = await apiFetch(`/api/current?${qs.toString()}`);
-    $('live-dot').classList.remove('stale');
-    if (data.unchanged) return;
-    state.etag = data.etag || '';
-    renderCurrent(data);
+    const reqSeq = ++state.currentReqSeq;
+    state.pollingCurrent = true;
+    try {
+      const qs = new URLSearchParams();
+      if (conv) qs.set('conversationId', conv);
+      if (!force && state.etag) qs.set('etag', state.etag);
+
+      const data = await apiFetch(`/api/current?${qs.toString()}`);
+      if (reqSeq !== state.currentReqSeq || conv !== currentConvId()) return;
+      $('live-dot').classList.remove('stale');
+      if (data.unchanged) return;
+      state.etag = data.etag || '';
+      renderCurrent(data);
+    } finally {
+      if (reqSeq === state.currentReqSeq) state.pollingCurrent = false;
+    }
   }
 
   async function pollOverview(force = false) {
     const now = Date.now();
-    if (!force && now - state.lastOverviewPollAt < OVERVIEW_POLL_MS) return;
+    if (!force && (state.pollingOverview || now - state.lastOverviewPollAt < OVERVIEW_POLL_MS)) return;
+
+    const targetRange = state.range;
+    const reqSeq = ++state.overviewReqSeq;
+    state.pollingOverview = true;
     state.lastOverviewPollAt = now;
+    try {
+      const qs = new URLSearchParams({ range: targetRange });
+      if (!force && state.overviewEtag) qs.set('etag', state.overviewEtag);
 
-    const qs = new URLSearchParams({ range: state.range });
-    if (!force && state.overviewEtag) qs.set('etag', state.overviewEtag);
-
-    const data = await apiFetch(`/api/overview?${qs.toString()}`);
-    $('live-dot').classList.remove('stale');
-    if (data.unchanged) return;
-    state.overviewEtag = data.etag || '';
-    renderOverview(data);
+      const data = await apiFetch(`/api/overview?${qs.toString()}`);
+      if (reqSeq !== state.overviewReqSeq || targetRange !== state.range) return;
+      $('live-dot').classList.remove('stale');
+      if (data.unchanged) return;
+      state.overviewEtag = data.etag || '';
+      renderOverview(data);
+    } finally {
+      if (reqSeq === state.overviewReqSeq) state.pollingOverview = false;
+    }
   }
 
   async function tick(force = false) {
@@ -618,10 +638,32 @@
     $('settings-backdrop').classList.add('hidden');
   }
 
+  function showToast(msg, isError = false) {
+    const toast = $('save-toast');
+    if (!toast) return;
+    if (state.toastTimer) {
+      clearTimeout(state.toastTimer);
+      state.toastTimer = null;
+    }
+    toast.textContent = msg;
+    toast.classList.toggle('warn-text', isError);
+    toast.classList.remove('hidden');
+    state.toastTimer = setTimeout(() => {
+      toast.classList.add('hidden');
+      toast.classList.remove('warn-text');
+      state.toastTimer = null;
+    }, 1800);
+  }
+
   $('btn-settings').addEventListener('click', openSettings);
   $('btn-close-settings').addEventListener('click', closeSettings);
   $('settings-backdrop').addEventListener('click', (e) => {
     if (e.target === $('settings-backdrop')) closeSettings();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('settings-backdrop').classList.contains('hidden')) {
+      closeSettings();
+    }
   });
 
   $('cur-usd').addEventListener('click', () => applyCurrencyButtons('USD'));
@@ -631,18 +673,26 @@
     const models = {};
     document.querySelectorAll('.pricing-card[data-model-id]').forEach((card) => {
       const id = card.dataset.modelId;
-      const getVal = (field) => Number(card.querySelector(`[data-field="${field}"]`)?.value);
+      const getVal = (field) => {
+        const raw = card.querySelector(`[data-field="${field}"]`)?.value?.trim() ?? '';
+        if (raw === '') return undefined;
+        const n = Number(raw);
+        return Number.isFinite(n) ? n : undefined;
+      };
+      const limitK = getVal('contextLimitK');
       models[id] = {
-        contextLimit: Math.round((getVal('contextLimitK') || 1000) * 1000),
+        contextLimit: limitK !== undefined && limitK >= 1 ? Math.round(limitK * 1000) : undefined,
         input: getVal('input'),
         cache: getVal('cache'),
         output: getVal('output'),
       };
     });
 
+    const rawRate = $('rate-input').value.trim();
+    const rateVal = rawRate === '' ? undefined : Number(rawRate);
     const payload = {
       currency: state.currencyDraft,
-      cnyRate: Number($('rate-input').value) || 7.25,
+      cnyRate: Number.isFinite(rateVal) && rateVal > 0 ? rateVal : undefined,
       models,
     };
 
@@ -655,11 +705,10 @@
       renderPricingDrawer(updated);
       state.etag = '';
       state.overviewEtag = '';
-      $('save-toast').classList.remove('hidden');
+      showToast('已保存');
       tick(true);
-      setTimeout(() => $('save-toast').classList.add('hidden'), 1800);
     } catch {
-      // ignore
+      showToast('保存失败', true);
     }
   });
 
@@ -673,15 +722,10 @@
       renderPricingDrawer(updated);
       state.etag = '';
       state.overviewEtag = '';
-      $('save-toast').textContent = '已恢复默认';
-      $('save-toast').classList.remove('hidden');
+      showToast('已恢复默认');
       tick(true);
-      setTimeout(() => {
-        $('save-toast').classList.add('hidden');
-        $('save-toast').textContent = '已保存';
-      }, 1800);
     } catch {
-      // ignore
+      showToast('恢复失败', true);
     }
   });
 

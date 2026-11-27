@@ -8,7 +8,7 @@
  *   <ANTIGRAVITY_EXECUTABLE_DATA_DIR>/pricing.json (or alongside main.mjs standalone)
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, watch, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, watch, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -29,6 +29,7 @@ const MAX_DURATION_MS = 180_000;
 const MAX_AVG_DURATION_MS = 120_000;
 const MIN_AVG_OUTPUT_TOKENS = 20;
 const MAX_VALID_TPS = 600;
+const MAX_PRICING_BODY_BYTES = 64 * 1024;
 
 const STATIC_FILES = {
   '/styles.css': ['styles.css', 'text/css; charset=utf-8'],
@@ -113,6 +114,21 @@ function timingsFilePath() {
   return dataFilePath('timings.json');
 }
 
+function writeFileAtomic(fp, content) {
+  const tmp = `${fp}.tmp.${process.pid}.${Date.now()}`;
+  try {
+    writeFileSync(tmp, content, 'utf-8');
+    renameSync(tmp, fp);
+  } catch {
+    try {
+      if (existsSync(tmp)) unlinkSync(tmp);
+    } catch {
+      // ignore cleanup error
+    }
+    writeFileSync(fp, content, 'utf-8');
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Observed step duration store (captures live mtime for text-only responses)
 // ---------------------------------------------------------------------------
@@ -159,7 +175,7 @@ function recordObservedDuration(convId, step, durationMs) {
     observedDurations.delete(oldest);
   }
   try {
-    writeFileSync(timingsFilePath(), JSON.stringify(Object.fromEntries(observedDurations)) + '\n', 'utf-8');
+    writeFileAtomic(timingsFilePath(), JSON.stringify(Object.fromEntries(observedDurations)) + '\n');
   } catch {
     // ignore write failure in read-only env
   }
@@ -184,10 +200,15 @@ function isAvgSpeedSample(output, durationMs, tps, estimated = false) {
 
 function sanitizeModelRule(rule, base) {
   const num = (v, fb) => {
+    if (v === null || v === undefined || v === '' || typeof v === 'boolean') return fb;
     const n = Number(v);
     return Number.isFinite(n) && n >= 0 ? n : fb;
   };
-  const limit = Number(rule?.contextLimit);
+  const rawLimit = rule?.contextLimit;
+  const limit =
+    rawLimit === null || rawLimit === undefined || rawLimit === '' || typeof rawLimit === 'boolean'
+      ? NaN
+      : Number(rawLimit);
   return {
     contextLimit: Number.isFinite(limit) && limit >= 1000 ? Math.round(limit) : base.contextLimit,
     input: num(rule?.input, base.input),
@@ -226,12 +247,14 @@ function loadPricing() {
 
 function savePricing(payload) {
   const current = loadPricing();
+  const rawRate = payload?.cnyRate;
+  const parsedRate =
+    rawRate === null || rawRate === undefined || rawRate === '' || typeof rawRate === 'boolean'
+      ? NaN
+      : Number(rawRate);
   const next = {
     currency: payload?.currency === 'CNY' ? 'CNY' : payload?.currency === 'USD' ? 'USD' : current.currency,
-    cnyRate:
-      Number.isFinite(Number(payload?.cnyRate)) && Number(payload.cnyRate) > 0
-        ? Number(payload.cnyRate)
-        : current.cnyRate,
+    cnyRate: Number.isFinite(parsedRate) && parsedRate > 0 ? parsedRate : current.cnyRate,
     fallback: payload?.fallback ? sanitizeModelRule(payload.fallback, current.fallback) : current.fallback,
     models: { ...current.models },
   };
@@ -241,14 +264,16 @@ function savePricing(payload) {
       next.models[k] = sanitizeModelRule(v, next.models[k] || next.fallback);
     }
   }
-  writeFileSync(pricingFilePath(), JSON.stringify(next, null, 2) + '\n', 'utf-8');
+  writeFileAtomic(pricingFilePath(), JSON.stringify(next, null, 2) + '\n');
+  overviewCache.clear();
   return next;
 }
 
 function resetPricing() {
   const fp = pricingFilePath();
   const next = structuredClone(DEFAULT_PRICING);
-  writeFileSync(fp, JSON.stringify(next, null, 2) + '\n', 'utf-8');
+  writeFileAtomic(fp, JSON.stringify(next, null, 2) + '\n');
+  overviewCache.clear();
   return next;
 }
 
@@ -276,9 +301,27 @@ function ruleForModel(modelId, pricing) {
   const id = String(modelId || '').toLowerCase();
   if (id && pricing.models[id]) return pricing.models[id];
   if (modelId && pricing.models[modelId]) return pricing.models[modelId];
-  // Fuzzy prefix/keyword match
-  for (const [k, v] of Object.entries(pricing.models)) {
-    if (id && (id.startsWith(k.toLowerCase()) || k.toLowerCase().startsWith(id))) return v;
+  // Fuzzy prefix match: longest prefix wins (e.g. gemini-2.5-flash-lite over gemini-2.5-flash)
+  if (id) {
+    let bestRule = null;
+    let bestScore = -1;
+    for (const [k, v] of Object.entries(pricing.models)) {
+      const kl = k.toLowerCase();
+      if (id.startsWith(kl)) {
+        const score = kl.length * 2 + 1;
+        if (score > bestScore) {
+          bestScore = score;
+          bestRule = v;
+        }
+      } else if (kl.startsWith(id)) {
+        const score = id.length * 2;
+        if (score > bestScore) {
+          bestScore = score;
+          bestRule = v;
+        }
+      }
+    }
+    if (bestRule) return bestRule;
   }
   if (id.includes('flash-lite') || id.includes('lite')) {
     return { contextLimit: 1000000, input: 0.075, cache: 0.01875, output: 0.3 };
@@ -423,9 +466,9 @@ function parseTranscript(appData, convId) {
       const model = typeof obj.model === 'string' && obj.model ? obj.model : 'unknown';
       const rawTs = typeof obj.created_at === 'string' ? Date.parse(obj.created_at) : NaN;
       const hasTools = Array.isArray(obj.tool_calls) && obj.tool_calls.length > 0;
+      const isDone = !obj.status || obj.status === 'DONE';
 
-      // 若两条 PLANNER_RESPONSE 连续出现（无人工等待），用下一条开始时间推导前一条耗时
-      resolvePendingByNextTs(rawTs);
+      // 不使用下一条 PLANNER_RESPONSE 推导前一条耗时，避免将轮间等待或未记录的工具执行时间计入生成速率
       pendingDurationCall = null;
       pendingDurationHasTools = false;
       lastRecordCall = null;
@@ -447,7 +490,7 @@ function parseTranscript(appData, convId) {
         calls.push(callItem);
         pendingDurationCall = callItem;
         pendingDurationHasTools = hasTools;
-        lastRecordCall = callItem;
+        lastRecordCall = isDone ? callItem : null;
       }
       pendingToolFlags = [];
       if (hasTools) {
@@ -628,6 +671,16 @@ function buildCurrentSnapshot(requestedConvId, pricing) {
     }
   }
 
+  // 新建对话仅有 USER_INPUT、尚未产生任何模型调用时，返回空态而非全 0 与 Unknown Model
+  const hasAnyCall = main.calls.length > 0 || subParsed.some((s) => s.calls.length > 0);
+  if (!hasAnyCall) {
+    return {
+      found: false,
+      conversationId: convId,
+      etag: `nocalls:${convId.toLowerCase()}:${main.key}:${pHash}`,
+    };
+  }
+
   let input = 0;
   let cache = 0;
   let output = 0;
@@ -682,6 +735,7 @@ function buildCurrentSnapshot(requestedConvId, pricing) {
         costUsd: cost,
         contextDelta,
         durationMs: c.durationMs,
+        durationEstimated: Boolean(c.durationEstimated),
         tps: c.tps,
       });
     }
@@ -737,6 +791,7 @@ function buildCurrentSnapshot(requestedConvId, pricing) {
     speed: {
       lastTps: latestSpeedCall ? latestSpeedCall.tps : null,
       lastDurationMs: latestSpeedCall ? latestSpeedCall.durationMs : null,
+      lastEstimated: latestSpeedCall ? Boolean(latestSpeedCall.durationEstimated) : false,
       lastOutput: latestSpeedCall ? latestSpeedCall.output : 0,
       avgTps,
       sampleCount: speedSamples,
@@ -891,6 +946,7 @@ function buildOverviewSnapshot(range, pricing, requestedEtag = '') {
           costUsd: cost,
           contextDelta,
           durationMs: c.durationMs,
+          durationEstimated: Boolean(c.durationEstimated),
           tps: c.tps,
         });
         if (recentPool.length > MAX_RECENT_CALLS * 4) {
@@ -1008,7 +1064,11 @@ function ensureFileWatcher(appData, entry, fp, now) {
     }
   }
   try {
-    const watcher = watch(fp, { persistent: false }, () => {
+    const watcher = watch(fp, { persistent: false }, (eventType) => {
+      if (eventType === 'rename') {
+        try { watcher.close(); } catch {}
+        activeFileWatchers.delete(fp);
+      }
       const st = statOf(fp);
       if (st.size <= 0) return;
       const sig = `${st.mtime}:${st.size}`;
@@ -1168,10 +1228,20 @@ async function start() {
     }
     if (req.method === 'POST' && url.pathname === '/api/pricing') {
       let raw = '';
+      let rawBytes = 0;
+      let tooLarge = false;
       req.on('data', (chunk) => {
+        rawBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk));
+        if (rawBytes > MAX_PRICING_BODY_BYTES) {
+          tooLarge = true;
+          send(413, { error: 'Payload too large' });
+          req.destroy();
+          return;
+        }
         raw += chunk;
       });
       req.on('end', () => {
+        if (tooLarge) return;
         try {
           const body = raw ? JSON.parse(raw) : {};
           if (body?.reset === true) {
