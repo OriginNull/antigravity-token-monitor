@@ -31,7 +31,7 @@ const MIN_AVG_DURATION_MS = 400;
 const MAX_DURATION_MS = 180_000;
 const MAX_AVG_DURATION_MS = 120_000;
 const MIN_AVG_OUTPUT_TOKENS = 20;
-const MAX_VALID_TPS = 600;
+const MAX_VALID_TPS = 1500;
 const MAX_PRICING_BODY_BYTES = 64 * 1024;
 
 const STATIC_FILES = {
@@ -1179,18 +1179,35 @@ function ensureFileWatcher(appData, entry, fp, now) {
   }
   try {
     const watcher = watch(fp, { persistent: false }, (eventType) => {
+      const st = statOf(fp);
+      if (st.size > 0) {
+        const sig = `${st.mtime}:${st.size}`;
+        if (lastWatchedStats.get(fp) !== sig) {
+          lastWatchedStats.set(fp, sig);
+          const info = activeFileWatchers.get(fp);
+          if (info) info.lastActiveMs = Date.now();
+          parseTranscript(appData, entry);
+        }
+      }
       if (eventType === 'rename') {
         try { watcher.close(); } catch {}
         activeFileWatchers.delete(fp);
+        // 原子写入替换 inode 后立即重绑监听，避免 1 秒采样真空期漏抓落盘耗时
+        const rebind = setTimeout(() => {
+          if (existsSync(fp)) {
+            ensureFileWatcher(appData, entry, fp, Date.now());
+            const latest = statOf(fp);
+            if (latest.size > 0) {
+              const latestSig = `${latest.mtime}:${latest.size}`;
+              if (lastWatchedStats.get(fp) !== latestSig) {
+                lastWatchedStats.set(fp, latestSig);
+                parseTranscript(appData, entry);
+              }
+            }
+          }
+        }, 60);
+        if (typeof rebind.unref === 'function') rebind.unref();
       }
-      const st = statOf(fp);
-      if (st.size <= 0) return;
-      const sig = `${st.mtime}:${st.size}`;
-      if (lastWatchedStats.get(fp) === sig) return;
-      lastWatchedStats.set(fp, sig);
-      const info = activeFileWatchers.get(fp);
-      if (info) info.lastActiveMs = Date.now();
-      parseTranscript(appData, entry);
     });
     watcher.on('error', () => {
       try { watcher.close(); } catch {}

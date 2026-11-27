@@ -20,12 +20,38 @@
 
 :root[data-theme="dark"] {
   color-scheme: dark;
+  --tm-bg: var(--background, #14171c);
+  --tm-card: var(--card, #1b1f27);
+  --tm-sec: var(--secondary, #262b36);
+  --tm-fg: var(--foreground, #e6eaf0);
+  --tm-muted: var(--muted-foreground, #8f98a6);
+  --tm-border: var(--card-border, rgba(255, 255, 255, 0.1));
+  --tm-primary: var(--primary, #3b82f6);
   --tm-ok: #4ade80;
   --tm-warn: #fbbf24;
   --tm-danger: #f87171;
   --tm-c-cache: var(--chart-2, #34d399);
   --tm-c-input: var(--chart-1, #60a5fa);
   --tm-c-output: var(--chart-3, #fbbf24);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --tm-bg: var(--background, #14171c);
+    --tm-card: var(--card, #1b1f27);
+    --tm-sec: var(--secondary, #262b36);
+    --tm-fg: var(--foreground, #e6eaf0);
+    --tm-muted: var(--muted-foreground, #8f98a6);
+    --tm-border: var(--card-border, rgba(255, 255, 255, 0.1));
+    --tm-primary: var(--primary, #3b82f6);
+    --tm-ok: #4ade80;
+    --tm-warn: #fbbf24;
+    --tm-danger: #f87171;
+    --tm-c-cache: var(--chart-2, #34d399);
+    --tm-c-input: var(--chart-1, #60a5fa);
+    --tm-c-output: var(--chart-3, #fbbf24);
+  }
 }
 
 * {
@@ -53,6 +79,7 @@ html, body {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
+  container-type: inline-size;
 }
 
 /* Header */
@@ -492,13 +519,29 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 4px 8px;
   min-width: 0;
+}
+
+.call-row-mid {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+}
+
+.call-mid-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
 .call-row-sub {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 6px;
   min-width: 0;
@@ -507,8 +550,10 @@ html, body {
 .call-left {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
 }
 
 .call-time {
@@ -1173,4 +1218,132 @@ html, body {
   height: 9px;
   border-radius: 2px;
   display: inline-block;
+}
+
+/* Narrow Sidecar Responsive Rules */
+@container (max-width: 420px) {
+  .topbar {
+    padding: 8px 10px;
+    gap: 6px;
+  }
+
+  .brand-title {
+    font-size: 12.5px;
+  }
+
+  .seg-btn {
+    font-size: 11.5px;
+    padding: 4px 7px;
+  }
+
+  .pane {
+    padding: 10px;
+  }
+
+  .card {
+    padding: 10px 11px;
+  }
+
+  .card.compact {
+    padding: 9px 11px;
+  }
+
+  .kpi-card {
+    padding: 9px 10px;
+  }
+
+  .kpi-val {
+    font-size: 15px;
+  }
+
+  .kpi-sub {
+    font-size: 11px;
+  }
+
+  .range-btn {
+    font-size: 11.5px;
+    padding: 3px 7px;
+  }
+
+  .speed-bar {
+    padding: 8px 11px;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+  }
+
+  .speed-right {
+    gap: 8px;
+  }
+
+  /* 分模型消耗在窄屏下自动转为双行：上行完整模型名 + 均速，下行消耗与费用，避免名称被挤压成 G... */
+  .model-head {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 2px;
+  }
+
+  .model-title-wrap {
+    justify-content: space-between;
+    width: 100%;
+  }
+
+  .model-nums {
+    font-size: 11px;
+  }
+
+  .call-item {
+    padding: 7px 8px;
+    gap: 3px;
+  }
+
+  .call-time {
+    font-size: 11px;
+  }
+
+  .call-tps {
+    font-size: 10px;
+    padding: 1px 4px;
+  }
+
+  .call-total {
+    font-size: 12.5px;
+  }
+
+  .call-cost {
+    font-size: 10.5px;
+  }
+
+  .call-right {
+    gap: 4px;
+  }
+
+  .call-breakdown {
+    gap: 3px 6px;
+    font-size: 10px;
+  }
+
+  .call-delta {
+    font-size: 10px;
+  }
+}
+
+@container (max-width: 320px) {
+  .brand-title {
+    font-size: 12px;
+  }
+
+  .seg-btn {
+    padding: 3px 6px;
+    font-size: 11px;
+  }
+
+  .icon-btn {
+    width: 26px;
+    height: 26px;
+  }
+
+  .range-btn {
+    padding: 2px 6px;
+    font-size: 11px;
+  }
 }

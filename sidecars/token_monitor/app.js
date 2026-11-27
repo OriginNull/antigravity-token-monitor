@@ -38,28 +38,81 @@
     'var(--chart-6, #06b6d4)',
   ];
 
-  // ---------- Host theme sync (mirrors builtin swarm_board) ----------
-  function syncScheme() {
-    const probe = document.createElement('span');
-    probe.style.cssText = 'position:absolute;visibility:hidden;color:var(--background, #f7f7f8)';
-    document.documentElement.appendChild(probe);
-    const c = getComputedStyle(probe).color;
-    probe.remove();
+  // ---------- Host & system theme sync ----------
+  const darkMedia = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+
+  function detectThemeFromColor(rawColor) {
+    if (!rawColor) return null;
+    const c = rawColor.trim().toLowerCase();
     const nums = (c.match(/[\d.]+/g) || []).map(Number);
-    if (nums.length < 3) return;
+    if (!nums.length) return null;
+    // oklch / oklab 首分量为亮度 L (0..1 或 0..100%)
+    if (c.startsWith('oklch(') || c.startsWith('oklab(')) {
+      const l = c.includes('%') && nums[0] > 1 ? nums[0] / 100 : nums[0];
+      return l < 0.5 ? 'dark' : 'light';
+    }
+    if (c.startsWith('lab(') || c.startsWith('lch(')) {
+      return nums[0] < 50 ? 'dark' : 'light';
+    }
+    if (nums.length < 3) return null;
     const scale = c.startsWith('color(') ? 1 : 255;
     const [r, g, b] = nums.slice(0, 3).map((v) => v / scale);
     const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    const theme = lum < 0.5 ? 'dark' : 'light';
+    return lum < 0.5 ? 'dark' : 'light';
+  }
+
+  function resolveTheme() {
+    const root = document.documentElement;
+    // 1. 优先依据宿主注入的 --background 计算真实明暗
+    const hostBgVar = getComputedStyle(root).getPropertyValue('--background').trim();
+    if (hostBgVar) {
+      const probe = document.createElement('span');
+      probe.style.cssText = 'position:absolute;visibility:hidden;color:var(--background)';
+      root.appendChild(probe);
+      const computed = getComputedStyle(probe).color;
+      probe.remove();
+      const detected = detectThemeFromColor(computed);
+      if (detected) return detected;
+    }
+    // 2. 其次检查宿主注入的 class 标记
+    if (root.classList.contains('dark')) return 'dark';
+    if (root.classList.contains('light')) return 'light';
+    // 3. 最终跟随系统深浅色模式
+    return darkMedia?.matches ? 'dark' : 'light';
+  }
+
+  function syncScheme() {
+    const theme = resolveTheme();
     if (document.documentElement.dataset.theme !== theme) {
       document.documentElement.dataset.theme = theme;
     }
   }
+
   syncScheme();
+  // 监听宿主通过行内 style / class / <head> 样式表 / themechange / 系统深浅模式触发的任意主题切换
   new MutationObserver(syncScheme).observe(document.documentElement, {
     attributes: true,
-    attributeFilter: ['style'],
+    attributeFilter: ['style', 'class', 'data-color-scheme'],
   });
+  if (document.head) {
+    new MutationObserver(syncScheme).observe(document.head, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+  }
+  window.addEventListener('themechange', syncScheme);
+  window.addEventListener('focus', syncScheme);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) syncScheme();
+  });
+  if (darkMedia) {
+    if (typeof darkMedia.addEventListener === 'function') {
+      darkMedia.addEventListener('change', syncScheme);
+    } else if (typeof darkMedia.addListener === 'function') {
+      darkMedia.addListener(syncScheme);
+    }
+  }
 
   // ---------- Sidecar API helpers ----------
   const urlParams = new URLSearchParams(location.search);
@@ -275,21 +328,26 @@
               <div class="call-left">
                 <span class="call-time">${fmtTime(c.ts)}</span>
                 ${c.isSubagent ? '<span class="call-badge">子</span>' : ''}
-                ${tpsText ? `<span class="${tpsClass}" title="${esc(fmtSpeedTitle(c.durationMs, c.durationEstimated))}">${tpsText}</span>` : ''}
-                ${modelLabel ? `<span class="call-model">${esc(modelLabel)}</span>` : ''}
               </div>
               <div class="call-right">
                 <span class="call-total">${fmtTokens(c.total)}</span>
                 <span class="call-cost">${fmtMoney(c.costUsd, currency, cnyRate)}</span>
               </div>
             </div>
+            ${(modelLabel || tpsText || deltaText) ? `
+            <div class="call-row-mid">
+              <span class="call-model">${esc(modelLabel)}</span>
+              <div class="call-mid-right">
+                ${tpsText ? `<span class="${tpsClass}" title="${esc(fmtSpeedTitle(c.durationMs, c.durationEstimated))}">${tpsText}</span>` : ''}
+                ${deltaText ? `<span class="${deltaClass}" title="${esc(fmtDeltaTitle(c.contextDelta))}">${deltaText}</span>` : ''}
+              </div>
+            </div>` : ''}
             <div class="call-row-sub">
               <div class="call-breakdown">
                 <span class="call-part"><i class="dot seg-input"></i>In ${fmtTokens(c.input)}</span>
-                <span class="call-part"><i class="dot seg-cache"></i>Cache ${fmtTokens(c.cache)}${c.cache > 0 ? ` (${hitPct}%)` : ''}</span>
+                <span class="call-part"><i class="dot seg-cache"></i>Cache ${fmtTokens(c.cache)}${c.cache > 0 ? `(${hitPct}%)` : ''}</span>
                 <span class="call-part"><i class="dot seg-output"></i>Out ${fmtTokens(c.output)}</span>
               </div>
-              ${deltaText ? `<span class="${deltaClass}" title="${esc(fmtDeltaTitle(c.contextDelta))}">${deltaText}</span>` : ''}
             </div>
           </div>
         `;
@@ -695,7 +753,8 @@
         const tone = tpsTone(c.tps, c.output);
         const tpsClass = tone ? `call-tps ${tone}` : 'call-tps';
         const hitPct = Math.round(Number(c.cacheHitRate) || 0);
-        const title = `${c.modelDisplay || c.model} · 会话 ${c.convShort || ''}`;
+        const modelLabel = c.modelDisplay || c.model || '';
+        const title = `${modelLabel} · 会话 ${c.convShort || ''}`;
 
         return `
           <div class="call-item${isNew ? ' call-new' : ''}" title="${esc(title)}">
@@ -703,21 +762,26 @@
               <div class="call-left">
                 <span class="call-time">${fmtTime(c.ts, true)}</span>
                 ${isCur ? '<span class="call-badge cur">当前</span>' : ''}
-                ${tpsText ? `<span class="${tpsClass}" title="${esc(fmtSpeedTitle(c.durationMs, c.durationEstimated))}">${tpsText}</span>` : ''}
-                <span class="call-model">${esc(c.modelDisplay || c.model)}</span>
               </div>
               <div class="call-right">
                 <span class="call-total">${fmtTokens(c.total)}</span>
                 <span class="call-cost">${fmtMoney(c.costUsd, currency, cnyRate)}</span>
               </div>
             </div>
+            ${(modelLabel || tpsText || deltaText) ? `
+            <div class="call-row-mid">
+              <span class="call-model">${esc(modelLabel)}</span>
+              <div class="call-mid-right">
+                ${tpsText ? `<span class="${tpsClass}" title="${esc(fmtSpeedTitle(c.durationMs, c.durationEstimated))}">${tpsText}</span>` : ''}
+                ${deltaText ? `<span class="${deltaClass}" title="${esc(fmtDeltaTitle(c.contextDelta))}">${deltaText}</span>` : ''}
+              </div>
+            </div>` : ''}
             <div class="call-row-sub">
               <div class="call-breakdown">
                 <span class="call-part"><i class="dot seg-input"></i>In ${fmtTokens(c.input)}</span>
-                <span class="call-part"><i class="dot seg-cache"></i>Cache ${fmtTokens(c.cache)}${c.cache > 0 ? ` (${hitPct}%)` : ''}</span>
+                <span class="call-part"><i class="dot seg-cache"></i>Cache ${fmtTokens(c.cache)}${c.cache > 0 ? `(${hitPct}%)` : ''}</span>
                 <span class="call-part"><i class="dot seg-output"></i>Out ${fmtTokens(c.output)}</span>
               </div>
-              ${deltaText ? `<span class="${deltaClass}" title="${esc(fmtDeltaTitle(c.contextDelta))}">${deltaText}</span>` : ''}
             </div>
           </div>
         `;
