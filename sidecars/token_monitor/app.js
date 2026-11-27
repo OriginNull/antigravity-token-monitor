@@ -231,18 +231,18 @@
       return;
     }
 
-    const { currency, cnyRate, model: activeModel } = data;
+    const { currency, cnyRate } = data;
     listEl.innerHTML = filtered
       .map((c) => {
         const isNew = newlyArrived.has(c.id);
-        const showModel = c.model && c.model !== activeModel;
+        const modelLabel = c.modelDisplay || c.model || '';
         const deltaText = fmtDelta(c.contextDelta);
         const deltaClass = c.contextDelta !== null && c.contextDelta < 0 ? 'call-delta down' : 'call-delta';
         const tpsText = fmtTps(c.tps);
         const tone = tpsTone(c.tps, c.output);
         const tpsClass = tone ? `call-tps ${tone}` : 'call-tps';
         const hitPct = Math.round(Number(c.cacheHitRate) || 0);
-        const subTitle = c.isSubagent ? `子助手 ${c.convShort || ''} · ${c.modelDisplay || c.model}` : c.modelDisplay || c.model;
+        const subTitle = c.isSubagent ? `子助手 ${c.convShort || ''} · ${modelLabel}` : modelLabel;
 
         return `
           <div class="call-item${isNew ? ' call-new' : ''}" title="${esc(subTitle)}">
@@ -251,7 +251,7 @@
                 <span class="call-time">${fmtTime(c.ts)}</span>
                 ${c.isSubagent ? '<span class="call-badge">子</span>' : ''}
                 ${tpsText ? `<span class="${tpsClass}" title="${esc(fmtSpeedTitle(c.durationMs, c.durationEstimated))}">${tpsText}</span>` : ''}
-                ${showModel ? `<span class="call-model">${esc(c.modelDisplay || c.model)}</span>` : ''}
+                ${modelLabel ? `<span class="call-model">${esc(modelLabel)}</span>` : ''}
               </div>
               <div class="call-right">
                 <span class="call-total">${fmtTokens(c.total)}</span>
